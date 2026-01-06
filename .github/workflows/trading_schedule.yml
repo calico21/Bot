@@ -1,0 +1,36 @@
+name: QuantBot Daily Run
+
+on:
+  schedule:
+    # Se ejecuta de Lunes a Viernes a las 14:30 UTC 
+    # (9:30 AM New York / 15:30 Madrid aprox)
+    - cron: '30 14 * * 1-5'
+  
+  # Botón para ejecutar manualmente cuando quieras probar
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout del código
+      uses: actions/checkout@v3
+
+    - name: Configurar Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Instalar librerías
+      run: |
+        pip install -r requirements.txt
+
+    - name: Ejecutar QuantBot
+      env:
+        # Aquí GitHub inyecta las claves secretas al código
+        ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+        ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python quant_execution.py
