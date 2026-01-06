@@ -1,203 +1,181 @@
-import alpaca_trade_api as tradeapi
+import os
 import time
 import requests
 import pandas as pd
 import numpy as np
-import os
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from quant_db_manager import MarketDB
+
+# --- LIBRERÍAS NUEVAS (SDK v2) ---
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 # ==========================================
-# 🔐 GESTIÓN DE CREDENCIALES
+# 🔐 CONFIGURACIÓN
 # ==========================================
 load_dotenv()
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+PAPER_MODE = True # Cambiar a False para dinero real
 
 if not API_KEY or not SECRET_KEY:
-    print("❌ ERROR: Faltan las claves API en el archivo .env o en GitHub Secrets.")
+    print("❌ ERROR: Faltan credenciales.")
     exit()
 
+# Clientes de Alpaca (Trading y Datos separados)
+trade_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
 # ==========================================
-# 🧠 ESTRATEGIA (GOLDEN CONFIG v240)
+# 🧠 ESTRATEGIA: MONTHLY FORTRESS (ROTACIÓN MENSUAL)
 # ==========================================
-class AlphaHunterStrategy:
+class MonthlyStrategy:
     def __init__(self):
-        self.tickers = [
-            'SPY', 'QQQ', 'DIA',            
-            'XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLY', 'XLP', 'XLU', 'XLB', 
-            'TLT', 'GLD', 'VNQ',            
-            'SMH', 'IGV', 'SOXX'
-        ]
-        self.top_n = 2 
-        self.db = MarketDB()
+        # UNIVERSO DE "ATAQUE" (Sectores Ofensivos)
+        self.risk_assets = ['XLK', 'SMH', 'XLF', 'XLV', 'XLI', 'XLY']
+        # ACTIVOS DE "DEFENSA" (Refugio)
+        self.safe_assets = ['IEF', 'SHV'] # Bonos 7-10 años y Cash corto plazo
+        # FILTRO DE MERCADO
+        self.market_filter = 'SPY'
         
-        # Configuración Maestra
-        self.lookback = 240         
-        self.target_vol = 0.40      
-        self.max_leverage = 2.0     
-        self.vol_window = 20        
+        self.lookback_days = 200  # Para la media móvil de seguridad
+        self.momentum_window = 126 # 6 Meses para ranking de fuerza
 
-    def get_data(self):
-        prices = self.db.load_data(self.tickers)
-        if prices.empty or len(prices.columns) < len(self.tickers):
-            print("⚡ Sincronizando datos...")
-            self.db.sync_data(self.tickers)
-            prices = self.db.load_data(self.tickers)
-        return prices
+    def get_data_alpaca(self, tickers, days):
+        """Descarga datos oficiales desde Alpaca"""
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days * 2) # Margen de seguridad
+        
+        req = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt
+        )
+        bars = data_client.get_stock_bars(req)
+        return bars.df # Devuelve DataFrame directo
 
-    def calculate_signals(self):
-        prices = self.get_data()
-        if prices.empty: return [], 0.0, 1.0
-
-        # A. Ranking (240 días)
-        recent_data = prices.iloc[-self.lookback:]
-        total_return = (recent_data.iloc[-1] / recent_data.iloc[0]) - 1
-        ranking = total_return.drop('SPY', errors='ignore')
-        top_assets = ranking.sort_values(ascending=False).head(self.top_n).index.tolist()
+    def get_signals(self):
+        print("📊 Analizando Régimen de Mercado...")
         
-        # B. Volatilidad
-        recent_prices_short = prices.iloc[-self.vol_window:][top_assets]
-        returns_short = recent_prices_short.pct_change().dropna()
+        # 1. FILTRO DE RÉGIMEN (¿Estamos en Crisis?)
+        spy_data = self.get_data_alpaca([self.market_filter], 300)
+        if spy_data.empty: return [], "ERROR_DATA"
         
-        if returns_short.empty: avg_vol = 0.01 
-        else: avg_vol = returns_short.mean(axis=1).std() * np.sqrt(252)
+        # Calcular Media Móvil 200 días
+        spy_closes = spy_data[spy_data['symbol'] == self.market_filter]['close']
+        sma_200 = spy_closes.rolling(window=200).mean().iloc[-1]
+        current_price = spy_closes.iloc[-1]
         
-        if avg_vol < 0.01: avg_vol = 0.01 
+        market_is_bullish = current_price > sma_200
         
-        leverage_factor = self.target_vol / avg_vol
-        final_leverage = min(leverage_factor, self.max_leverage)
-        weight_per_asset = final_leverage / self.top_n
+        if not market_is_bullish:
+            print(f"🐻 MERCADO BAJISTA DETECTADO (SPY ${current_price:.2f} < SMA200 ${sma_200:.2f})")
+            print("🛡️ MODO DEFENSA: Comprando Bonos.")
+            return ['IEF'], "DEFENSE"
         
-        return top_assets, weight_per_asset, final_leverage
+        print(f"🐂 MERCADO ALCISTA CONFIRMADO (SPY > SMA200)")
+        
+        # 2. RANKING DE MOMENTUM (¿Qué sectores lideran?)
+        risk_data = self.get_data_alpaca(self.risk_assets, self.momentum_window + 20)
+        scores = {}
+        
+        for ticker in self.risk_assets:
+            try:
+                df = risk_data[risk_data['symbol'] == ticker]['close']
+                if len(df) < self.momentum_window: continue
+                
+                # Momentum de 6 meses (Retorno)
+                # Fórmula: Precio Hoy / Precio hace 126 días - 1
+                ret = (df.iloc[-1] / df.iloc[-self.momentum_window]) - 1
+                scores[ticker] = ret
+            except: continue
+            
+        # Elegir el TOP 1 (El más fuerte) o TOP 2
+        # La "Ruta Inteligente" suele concentrar en el mejor. Vamos con el TOP 1 para máxima potencia.
+        top_asset = sorted(scores, key=scores.get, reverse=True)[:1]
+        
+        print(f"🚀 LÍDER DEL MERCADO: {top_asset} (Ret: {scores[top_asset[0]]:.2%})")
+        return top_asset, "ATTACK"
 
 # ==========================================
-# 🤖 MOTOR DE EJECUCIÓN (CON REPORTING AVANZADO)
+# 🤖 MOTOR DE EJECUCIÓN (LIMIT ORDERS)
 # ==========================================
 def send_telegram(msg):
     if not TELEGRAM_TOKEN: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+def run_bot():
+    print(f"\n=== 🏯 MONTHLY FORTRESS EJECUTANDO ({datetime.now()}) ===")
+    strategy = MonthlyStrategy()
+    
+    # 1. OBTENER SEÑAL
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except: pass
+        target_assets, mode = strategy.get_signals()
+    except Exception as e:
+        print(f"❌ Error calculando señales: {e}")
+        return
 
-class ExecutionEngine:
-    def __init__(self):
-        self.api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
-        self.strategy = AlphaHunterStrategy()
-
-    def get_daily_stats(self):
-        """Calcula Ganancias/Pérdidas del día"""
+    # 2. ESTADO DE CUENTA
+    acct = trade_client.get_account()
+    equity = float(acct.equity)
+    buying_power = float(acct.buying_power)
+    
+    msg = f"📅 *Monthly Rebalance*\n💰 Equity: ${equity:,.0f}\nModo: {'🟢 ATAQUE' if mode == 'ATTACK' else '🔴 DEFENSA'}\nObjetivo: {target_assets}"
+    send_telegram(msg)
+    
+    # 3. GESTIÓN DE POSICIONES
+    # Primero obtenemos posiciones actuales
+    current_positions = trade_client.get_all_positions()
+    current_tickers = [p.symbol for p in current_positions]
+    
+    # A. VENDER LO QUE YA NO QUEREMOS
+    for p in current_positions:
+        if p.symbol not in target_assets:
+            print(f"🔻 CERRANDO: {p.symbol}")
+            trade_client.close_position(p.symbol) # Venta a mercado para cerrar rápido
+            send_telegram(f"👋 Cerrando {p.symbol}")
+    
+    # Esperar a que se libere el cash
+    if current_tickers: time.sleep(5) 
+    
+    # B. COMPRAR EL NUEVO LÍDER
+    # Usamos el 95% del equity para dejar margen
+    target_val = float(trade_client.get_account().cash) * 0.95
+    
+    for symbol in target_assets:
         try:
-            account = self.api.get_account()
-            equity = float(account.equity)
-            last_equity = float(account.last_equity) # Valor al cierre de ayer
+            # Obtener precio actual para calcular límite
+            quote = data_client.get_stock_latest_quote(StockBarsRequest(symbol_or_symbols=[symbol]))
+            current_price = quote[symbol].ask_price
             
-            pnl_amount = equity - last_equity
-            pnl_pct = (pnl_amount / last_equity) * 100
+            # PROTECCIÓN: Limit Order un 0.5% arriba (Asegura entrada pero evita slippage infinito)
+            limit_price = round(current_price * 1.005, 2)
+            qty = int(target_val / limit_price)
             
-            return equity, pnl_amount, pnl_pct
-        except:
-            return 0.0, 0.0, 0.0
-
-    def rebalance(self):
-        print("\n=== 🦁 INICIANDO QUANTBOT (REPORTING MODE) ===")
-        
-        # 1. INFORME DE ESTADO (NUEVO)
-        equity, daily_pnl, daily_pct = self.get_daily_stats()
-        
-        # Icono dinámico según ganancias o pérdidas
-        icon = "🟢" if daily_pnl >= 0 else "🔴"
-        
-        report = (
-            f"📅 *Informe Diario QuantBot*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 *Capital:* ${equity:,.2f}\n"
-            f"{icon} *P&L Hoy:* ${daily_pnl:,.2f} ({daily_pct:+.2f}%)\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚙️ *Analizando mercado...*"
-        )
-        send_telegram(report)
-
-        # 2. CÁLCULO DE ESTRATEGIA
-        target_assets, target_weight, lev = self.strategy.calculate_signals()
-        
-        if not target_assets:
-            send_telegram("⚠️ Error: No hay datos suficientes para operar.")
-            return
-
-        print(f"🎯 Objetivos: {target_assets} (Lev: x{lev:.2f})")
-        
-        # 3. DATOS DE CUENTA
-        account = self.api.get_account()
-        buying_power = float(account.buying_power)
-        
-        target_val_per_asset = equity * target_weight
-        
-        # Ajuste de seguridad
-        total_needed = target_val_per_asset * len(target_assets)
-        if total_needed > buying_power:
-            target_val_per_asset = (buying_power * 0.95) / len(target_assets)
-
-        try:
-            positions = self.api.list_positions()
-            current_positions = {p.symbol: int(p.qty) for p in positions}
-        except: current_positions = {}
-        
-        # 4. EJECUCIÓN (Ventas primero)
-        actions_log = ""
-        
-        for symbol, qty in current_positions.items():
-            if symbol not in target_assets:
-                try:
-                    self.api.submit_order(symbol=symbol, qty=qty, side='sell', type='market', time_in_force='day')
-                    msg = f"👋 Venta: {symbol}"
-                    print(msg)
-                    actions_log += f"{msg}\n"
-                except: pass
-        
-        time.sleep(2)
-        
-        # 5. EJECUCIÓN (Compras)
-        for symbol in target_assets:
-            try:
-                price = float(self.api.get_latest_trade(symbol).price)
-                if price <= 0: continue
+            if qty > 0:
+                print(f"🚀 ORDEN LIMIT: {symbol} x {qty} @ ${limit_price}")
                 
-                target_qty = int(target_val_per_asset / price)
-                current_qty = current_positions.get(symbol, 0)
-                diff = target_qty - current_qty
+                req = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price
+                )
                 
-                if diff > 0:
-                    self.api.submit_order(symbol=symbol, qty=diff, side='buy', type='market', time_in_force='day')
-                    msg = f"🚀 Compra: {symbol} (+{diff})"
-                    print(msg)
-                    actions_log += f"{msg}\n"
-                elif diff < 0:
-                    sell_diff = abs(diff)
-                    self.api.submit_order(symbol=symbol, qty=sell_diff, side='sell', type='market', time_in_force='day')
-                    msg = f"📉 Ajuste: {symbol} (-{sell_diff})"
-                    print(msg)
-                    actions_log += f"{msg}\n"
-                else:
-                    # Si no hay cambios, lo registramos para saber que está vigilando
-                    pass # Mantenemos posición
-                    
-            except Exception as e:
-                print(f"❌ Error {symbol}: {e}")
-
-        # 6. RESUMEN FINAL A TELEGRAM
-        if actions_log:
-            send_telegram(f"⚡ *Actividad Ejecutada:*\n{actions_log}")
-        else:
-            send_telegram(f"😴 *Sin cambios:* Mantenemos posiciones\n({', '.join(target_assets)})")
-
-        print("✅ Ejecución completada.")
+                trade_client.submit_order(req)
+                send_telegram(f"🚀 *Compra*: {symbol}\nQty: {qty}\nLimit: ${limit_price}")
+            
+        except Exception as e:
+            print(f"❌ Error comprando {symbol}: {e}")
 
 if __name__ == "__main__":
-    bot = ExecutionEngine()
-    bot.rebalance()
+    run_bot()
