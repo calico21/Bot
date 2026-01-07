@@ -23,7 +23,7 @@ class MarketDB:
         ''')
         self.conn.commit()
 
-    def sync_data(self, tickers, start_date="2010-01-01"):
+    def sync_data(self, tickers, start_date="2005-01-01"):
         """
         Descarga datos de Yahoo y actualiza la Base de Datos Local.
         """
@@ -122,10 +122,9 @@ class MarketDB:
 if __name__ == "__main__":
     # Universo de Sectores + Bonos + Oro
     MY_UNIVERSE = [
-        'XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLY', 'XLP', 'XLU', 'XLB', # Sectores
-        'SPY', 'TLT', 'GLD', 'SHV' # Benchmarks y Activos Macro
+    'XLK', 'SMH', 'XLF', 'XLE', 'XLV', 'XLI', 'XLY', 'XLP', 'XLU', 'XLB',
+    'SPY', 'TLT', 'GLD', 'SHV', 'IEF'
     ]
-    
     db = MarketDB()
     # 1. Descargar y Guardar (Solo se hace una vez al día/semana)
     db.sync_data(MY_UNIVERSE)
