@@ -1,11 +1,10 @@
 name: Monthly Fortress Bot
 
 on:
-  # Schedule: Run at 15:00 UTC on the 1st day of every month
   schedule:
+    # Run at 15:00 UTC (10:00 AM NY) on the 1st of every month
     - cron: '00 15 1 * *'
   
-  # Manual Button
   workflow_dispatch:
 
 jobs:
@@ -25,17 +24,12 @@ jobs:
       run: |
         pip install -r requirements.txt
 
-    # --- CRITICAL FIX 1: DOWNLOAD DATA FIRST ---
-    - name: Download Market Data
-      run: python setup_data.py
+    # NOTICE: The "Download Market Data" step is GONE.
 
-    # --- CRITICAL FIX 2: RUN THE CORRECT FILE ---
     - name: Execute Strategy
       env:
         ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
         ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        # (Optional) You can leave Telegram secrets here, 
-        # but your current code doesn't use them yet.
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python execution.py
