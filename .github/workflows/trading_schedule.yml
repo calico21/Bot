@@ -1,36 +1,41 @@
-name: QuantBot Daily Run
+name: Monthly Fortress Bot
 
 on:
+  # Schedule: Run at 14:30 UTC on the 1st day of every month
   schedule:
-    # Se ejecuta de Lunes a Viernes a las 14:30 UTC 
-    # (9:30 AM New York / 15:30 Madrid aprox)
-    - cron: '30 14 * * 1-5'
+    - cron: '30 14 1 * *'
   
-  # Botón para ejecutar manualmente cuando quieras probar
+  # Manual Button
   workflow_dispatch:
 
 jobs:
-  build:
+  trade:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout del código
+    - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Configurar Python
+    - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.10'
 
-    - name: Instalar librerías
+    - name: Install Libraries
       run: |
         pip install -r requirements.txt
 
-    - name: Ejecutar QuantBot
+    # --- CRITICAL FIX 1: DOWNLOAD DATA FIRST ---
+    - name: Download Market Data
+      run: python setup_data.py
+
+    # --- CRITICAL FIX 2: RUN THE CORRECT FILE ---
+    - name: Execute Strategy
       env:
-        # Aquí GitHub inyecta las claves secretas al código
         ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
         ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        # (Optional) You can leave Telegram secrets here, 
+        # but your current code doesn't use them yet.
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python quant_execution.py
+      run: python execution.py
