@@ -9,7 +9,7 @@ from reports import (
     print_annual_returns_table
 )
 
-START_CAPITAL = 10_000
+START_CAPITAL = 100_000
 
 
 def backtest_monthly_fortress():

@@ -23,7 +23,7 @@ class MarketDB:
         ''')
         self.conn.commit()
 
-    def sync_data(self, tickers, start_date="2005-01-01"):
+    def sync_data(self, tickers, start_date="2000-01-01"):
         """
         Descarga datos de Yahoo y actualiza la Base de Datos Local.
         """
