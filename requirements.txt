@@ -1,5 +1,7 @@
-alpaca-py
 pandas
 numpy
-python-dotenv
+scipy
+yfinance
+alpaca-py
 requests
+pyarrow
