@@ -1,6 +1,7 @@
 # research.py
 
 import itertools
+import signal
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,13 +18,14 @@ from reports import (
 
 # --- CONFIG ---
 START_CAPITAL = 100_000
+SLIPPAGE_PER_TURNOVER = 0.001  # 10 bps per 100% turnover
 
 # ============================================================
 # Helper: Run the MAIN Strategy (The Baseline)
 # ============================================================
-def run_full_strategy_backtest() -> pd.Series:
+def run_full_strategy_backtest(strat_override=None):
     db = MarketDB()
-    strat = MonthlyFortressStrategy()
+    strat = strat_override or MonthlyFortressStrategy()
     
     tickers = list(set(
         strat.risk_assets + 
@@ -31,28 +33,32 @@ def run_full_strategy_backtest() -> pd.Series:
         [strat.market_filter, strat.bond_benchmark]
     ))
     
-    prices = db.load_data(tickers)
-    # Justo después de db.load_data(tickers)
-    prices = prices.fillna(method='bfill') # Rellena hacia atrás con el primer precio disponible
+    prices = db.load_data(tickers).bfill()
     db.close()
 
-    try: prices = prices.loc["2000-01-01":]
-    except: pass
+    try:
+        prices = prices.loc["2000-01-01":]
+    except Exception:
+        pass
 
     monthly_dates = prices.resample("ME").last().index
     equity = START_CAPITAL
     equity_curve = []
     equity_dates = []
     
-    current_portfolio = {}
+    current_portfolio = {}  # weights
     last_prices = {}
+    turnover_series = []
 
     for date in monthly_dates:
-        if date not in prices.index: continue
+        if date not in prices.index:
+            continue
         
-        target_list = strat.get_signal(prices, date) 
+        # Get target weights from strategy
+        target_list = strat.get_signal(prices, date)
         target_dict = {t: w for t, w in target_list}
 
+        # Apply portfolio return from last month to this date
         if current_portfolio and last_prices:
             port_ret = 0.0
             for t, w in current_portfolio.items():
@@ -60,17 +66,47 @@ def run_full_strategy_backtest() -> pd.Series:
                     price_today = prices[t].loc[date]
                     price_then = last_prices.get(t)
                     if price_then and not pd.isna(price_today):
-                        asset_ret = price_today / price_then
-                        port_ret += w * (asset_ret - 1.0)
+                        asset_ret = price_today / price_then - 1.0
+                        port_ret += w * asset_ret
             equity *= (1.0 + port_ret)
 
+        # Delta-based rebalancing: compute turnover between old and new weights
+        if current_portfolio:
+            all_tickers = set(current_portfolio.keys()) | set(target_dict.keys())
+            gross_turnover = 0.0
+            for t in all_tickers:
+                w_old = current_portfolio.get(t, 0.0)
+                w_new = target_dict.get(t, 0.0)
+                gross_turnover += abs(w_new - w_old)
+            # Standard definition: turnover = 0.5 * sum |w_new - w_old|
+            turnover = 0.5 * gross_turnover
+        else:
+            turnover = 0.0
+
+        # Apply slippage cost proportional to turnover
+        if turnover > 0:
+            equity *= (1.0 - SLIPPAGE_PER_TURNOVER * turnover)
+
+        turnover_series.append(turnover)
+
+        # Update portfolio to new target weights
         current_portfolio = target_dict
         last_prices = {t: prices[t].loc[date] for t in current_portfolio.keys()}
         
         equity_curve.append(equity)
         equity_dates.append(date)
 
-    return pd.Series(equity_curve, index=pd.DatetimeIndex(equity_dates))
+    equity_series = pd.Series(equity_curve, index=pd.DatetimeIndex(equity_dates))
+    turnover_series = pd.Series(turnover_series, index=pd.DatetimeIndex(equity_dates))
+
+    # Optional: print basic turnover stats
+    if not turnover_series.empty:
+        avg_turnover = turnover_series.mean()
+        max_turnover = turnover_series.max()
+        print(f"\nTurnover stats (monthly): avg={avg_turnover:.3f}, max={max_turnover:.3f}")
+
+    return equity_series, turnover_series, prices, strat
+
 
 # ============================================================
 # PLOTTING & ANALYSIS
@@ -91,7 +127,7 @@ def plot_monte_carlo(equity_curve: pd.Series, n_sims=1000):
             sim_equity.append(sim_equity[-1] * (1 + r))
         
         final_values.append(sim_equity[-1])
-        if i < 100: # Plot 100 lines only
+        if i < 100:  # Plot 100 lines only
             plt.plot(equity_curve.index[:len(sim_equity)], sim_equity, color='gray', alpha=0.05)
 
     plt.plot(equity_curve.index, equity_curve, color='#FF5733', linewidth=2, label='Actual Strategy')
@@ -204,17 +240,103 @@ def plot_comparisons(base_equity):
     plt.savefig("chart_1_performance_comparison.png")
     plt.show()
 
-# ============================================================
-# Main
-# ============================================================
+def plot_turnover(turnover_series):
+    plt.figure(figsize=(12, 4))
+    plt.plot(turnover_series, color='darkorange', linewidth=1.5)
+    plt.title("Monthly Portfolio Turnover", fontsize=12)
+    plt.ylabel("Turnover (0–1)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("chart_4_turnover.png")
+    plt.show()
+
+def plot_slippage_cost(turnover_series, equity_curve, slippage_per_turnover):
+    slippage_cost = (turnover_series * slippage_per_turnover).fillna(0)
+    cumulative_cost = (1 - slippage_cost).cumprod()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(cumulative_cost, color='red', linewidth=1.5)
+    plt.title("Cumulative Slippage Impact", fontsize=12)
+    plt.ylabel("Multiplier")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("chart_5_slippage.png")
+    plt.show()
+
+def plot_regime_timeline(prices, strat, equity_curve):
+    regimes = []
+    for date in equity_curve.index:
+        regimes.append(strat.detect_regime(prices, date))
+
+    regime_series = pd.Series(regimes, index=equity_curve.index)
+
+    colors = {
+        "bull": "green",
+        "bear": "red",
+        "high_vol": "orange",
+        "crash": "black",
+        "unknown": "gray"
+    }
+
+    plt.figure(figsize=(12, 4))
+    for reg, col in colors.items():
+        mask = (regime_series == reg)
+        plt.fill_between(regime_series.index, 0, 1, where=mask,
+                         color=col, alpha=0.15, transform=plt.gca().get_xaxis_transform())
+
+    plt.plot(equity_curve.index, equity_curve / equity_curve.iloc[0],
+             color='blue', linewidth=1.5)
+
+    plt.title("Regime Timeline Overlay", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("chart_6_regime_timeline.png")
+    plt.show()
+
+def plot_rolling_metrics(equity_curve):
+    rets = equity_curve.pct_change().dropna()
+
+    rolling_cagr = (1 + rets).rolling(36).apply(lambda x: np.prod(x)**(12/36) - 1)
+    rolling_vol = rets.rolling(36).std() * np.sqrt(12)
+
+    def rolling_dd(series, window=36):
+        dd = []
+        for i in range(window, len(series)):
+            window_curve = series.iloc[i-window:i]
+            dd.append((window_curve / window_curve.cummax() - 1).min())
+        return pd.Series(dd, index=series.index[window:])
+
+    rolling_maxdd = rolling_dd(equity_curve)
+
+    fig, axs = plt.subplots(3, 1, figsize=(12, 12))
+
+    axs[0].plot(rolling_cagr, color='blue')
+    axs[0].set_title("Rolling 3-Year CAGR")
+    axs[0].grid(True, alpha=0.3)
+
+    axs[1].plot(rolling_maxdd, color='red')
+    axs[1].set_title("Rolling 3-Year Max Drawdown")
+    axs[1].grid(True, alpha=0.3)
+
+    axs[2].plot(rolling_vol, color='purple')
+    axs[2].set_title("Rolling 3-Year Volatility")
+    axs[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("chart_7_rolling_metrics.png")
+    plt.show()
+
+
 if __name__ == "__main__":
     print(f"\n=== BASELINE BACKTEST (Capital: ${START_CAPITAL:,.0f}) ===")
-    base_equity = run_full_strategy_backtest()
+    base_equity, turnover_series, prices, strat = run_full_strategy_backtest()
     print_performance_report(base_equity, None, name="Baseline")
 
     print("\n📊 Generating Clean Dashboards...")
     plot_comparisons(base_equity)
     plot_advanced_dashboard(base_equity)
-    
-    if base_equity is not None and not base_equity.empty:
-        plot_monte_carlo(base_equity, n_sims=10000)
+    plot_turnover(turnover_series)
+    plot_slippage_cost(turnover_series, base_equity, SLIPPAGE_PER_TURNOVER)
+    plot_regime_timeline(prices, strat, base_equity)
+    plot_rolling_metrics(base_equity)
+    plot_monte_carlo(base_equity, n_sims=10000)

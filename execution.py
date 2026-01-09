@@ -1,10 +1,10 @@
-# execution.py
-
 import os
 import requests
-from datetime import datetime, timedelta
 import pandas as pd
+from datetime import datetime, timedelta
+from decimal import Decimal
 
+# Alpaca Libraries
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -13,7 +13,8 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
-from strategy import MonthlyFortressStrategy
+# Import Strategy
+from strategy import MonthlyFortressStrategy, RSI2MeanReversionStrategy, CompositeStrategy
 
 # --- CONFIG ---
 API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -32,28 +33,43 @@ def send_telegram(message):
     try: requests.post(url, json=payload)
     except: pass
 
-def get_price_history_alpaca(tickers, days=400):
-    """Gets historical data using the IEX Feed (Free)."""
+def get_price_history_alpaca(tickers, days=800):
+    """
+    Gets historical data using the IEX Feed.
+    FIXED: days=800 because Strategy needs 504 trading days (2 years). 
+    400 days is not enough math history.
+    """
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days)
-    req = StockBarsRequest(
-        symbol_or_symbols=tickers,
-        timeframe=TimeFrame.Day,
-        start=start_dt,
-        end=end_dt,
-        feed=DataFeed.IEX
-    )
-    bars = data_client.get_stock_bars(req)
-    df = bars.df.reset_index()
-    pivot = df.pivot(index="timestamp", columns="symbol", values="close")
-    pivot.index = pivot.index.tz_convert(None) 
-    return pivot
+    
+    # Alpaca handles list of tickers automatically
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt,
+            feed=DataFeed.IEX
+        )
+        bars = data_client.get_stock_bars(req)
+        if bars.df.empty: return pd.DataFrame()
+        
+        df = bars.df.reset_index()
+        pivot = df.pivot(index="timestamp", columns="symbol", values="close")
+        pivot.index = pivot.index.tz_convert(None) 
+        return pivot
+    except Exception as e:
+        print(f"Data Fetch Error: {e}")
+        return pd.DataFrame()
 
 def execute_monthly_rebalance():
     print("--- 🚀 STARTING MONTHLY REBALANCE ---")
-    send_telegram("🚀 **Monthly Fortress Bot**\nAnalyzing market data...")
+    send_telegram("🚀 **Fortress Centurion Bot**\nAnalyzing market data...")
     
-    strat = MonthlyFortressStrategy()
+    # Initialize Centurion Strategy (90/10 Split)
+    core = MonthlyFortressStrategy()
+    sat = RSI2MeanReversionStrategy()
+    strat = CompositeStrategy(main_strat=core, sat_strat=sat, main_weight=0.9)
     
     # 1. Get Universe Data
     all_tickers = list(set(strat.risk_assets + strat.safe_assets + [strat.market_filter, strat.bond_benchmark]))
@@ -63,10 +79,14 @@ def execute_monthly_rebalance():
         send_telegram(f"❌ Data Error: {e}")
         return
 
-    if prices.empty: return
+    if prices.empty: 
+        print("No data found.")
+        return
 
     # 2. Get Signal
     today = prices.index[-1]
+    print(f"Signal Date: {today}")
+    
     target_portfolio = strat.get_signal(prices, today)
     target_dict = {t: w for t, w in target_portfolio}
     
@@ -82,21 +102,29 @@ def execute_monthly_rebalance():
     # 4. Sell First
     current_holdings = {p.symbol: float(p.qty) for p in positions}
     for p in positions:
-        if p.symbol not in target_dict:
-            trade_client.close_position(p.symbol)
-            trade_log.append(f"🔴 Sold {p.symbol}")
+        # Close if not in target or weight is 0
+        if p.symbol not in target_dict or target_dict[p.symbol] <= 0:
+            print(f"Closing {p.symbol}...")
+            try:
+                trade_client.close_position(p.symbol)
+                trade_log.append(f"🔴 Sold All {p.symbol}")
+            except Exception as e:
+                print(f"Error closing {p.symbol}: {e}")
             
     # 5. Buy New Positions
-    target_equity = float(trade_client.get_account().equity) * 0.93 # 7% Buffer for slippage/price moves
+    # 5% Cash Buffer for safety
+    target_equity = float(trade_client.get_account().equity) * 0.95
     
     for symbol, weight in target_dict.items():
-        # Fallback price logic
         price = last_known_prices.get(symbol)
         if not price: 
             print(f"Skipping {symbol} (No Price)")
             continue
             
         target_val = target_equity * weight
+        # Dust filter: Ignore tiny trades
+        if target_val < 500: continue
+        
         target_qty = int(target_val / price)
         current_qty = current_holdings.get(symbol, 0)
         delta_qty = target_qty - current_qty
@@ -120,8 +148,14 @@ def execute_monthly_rebalance():
 
     # 6. Report
     report = f"✅ **Rebalance Complete**\n💰 Equity: ${equity:,.2f}\n\n"
-    report += "\n".join(trade_log) if trade_log else "No trades needed."
-    report += "\n\n**Target:**\n" + "\n".join([f"• {s}: {w:.1%}" for s, w in target_dict.items()])
+    if trade_log:
+        # Summarize to avoid hitting Telegram limits
+        report += "\n".join(trade_log[:15])
+        if len(trade_log) > 15: report += f"\n...and {len(trade_log)-15} more."
+    else: 
+        report += "No trades needed."
+        
+    report += "\n\n**Top Bets:**\n" + "\n".join([f"• {s}: {w:.1%}" for s, w in sorted(target_dict.items(), key=lambda x: x[1], reverse=True)[:10]])
     
     send_telegram(report)
     print("--- COMPLETE ---")
