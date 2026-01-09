@@ -2,8 +2,8 @@ name: Monthly Fortress Bot
 
 on:
   schedule:
-    # Run at 15:00 UTC (10:00 AM NY) on the 1st of every month
-    - cron: '00 15 1 * *'
+    # Run at 15:30 UTC (10:30 AM NY) on the 1st of every month
+    - cron: '30 15 1 * *'
   
   workflow_dispatch:
 
