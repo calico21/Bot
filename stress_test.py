@@ -2,11 +2,18 @@
 
 import numpy as np
 import pandas as pd
+import warnings
+
+# --- SILENCE PANDAS FUTURE WARNINGS ---
+# This suppresses the "fill_method='pad'" warnings from strategy.py
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 from quant_db_manager import MarketDB
 from strategy import MonthlyFortressStrategy
 
 # --- CONFIGURATION ---
-SIMULATIONS = 1000   # How many "Alternative Universes" to run
+SIMULATIONS = 100000   # How many "Alternative Universes" to run
 YEARS = 20           # Length of simulation
 START_CAPITAL = 10000
 
@@ -16,7 +23,7 @@ def get_strategy_returns():
     """
     print("--- Extracting Strategy DNA (Daily Returns) ---")
     
-    # 1. Initialize DB (Using MarketDB to match your backup)
+    # 1. Initialize DB
     db = MarketDB()
     strat = MonthlyFortressStrategy()
     
@@ -27,11 +34,10 @@ def get_strategy_returns():
         [strat.market_filter, strat.bond_benchmark]
     ))
     
-    # Using 'load_data' which is the method name in your backup's MarketDB
     prices = db.load_data(all_tickers)
     db.close()
     
-    # Filter 2005+ (Same filter as your backtest)
+    # Filter 2005+
     try: prices = prices.loc["2005-01-01":]
     except: pass
     
@@ -40,9 +46,9 @@ def get_strategy_returns():
     cash = START_CAPITAL
     holdings = {}
     
-    # We need to reconstruct the daily equity curve to get daily returns
     equity_curve = []
     
+    # Identify rebalance dates (Month End)
     monthly_dates = prices.resample('ME').last().index
     valid_dates = set(dates)
     clean_rebalance_dates = set()
@@ -50,7 +56,9 @@ def get_strategy_returns():
         loc = dates.searchsorted(d)
         if loc > 0: clean_rebalance_dates.add(dates[loc-1])
 
-    for d in dates:
+    total_steps = len(dates)
+    
+    for i, d in enumerate(dates):
         # Update Value
         day_val = cash
         for t, qty in holdings.items():
@@ -62,6 +70,10 @@ def get_strategy_returns():
         
         # Rebalance
         if d in clean_rebalance_dates:
+            # Print progress periodically to show it's not frozen
+            if i % 500 == 0:
+                print(f"Processing date: {d.date()}...")
+                
             target = dict(strat.get_signal(prices, d))
             holdings = {}
             cash = day_val
@@ -89,7 +101,6 @@ def run_monte_carlo(daily_returns):
     
     for i in range(SIMULATIONS):
         # 1. Shuffle the returns (Randomize the order of days)
-        # We sample with replacement to simulate "infinite" variations
         sim_rets = np.random.choice(daily_returns, size=n_days, replace=True)
         
         # 2. Build Equity Curve
@@ -98,9 +109,9 @@ def run_monte_carlo(daily_returns):
         # 3. Calculate Metrics
         final_val = sim_curve[-1]
         
-        # Avoid division by zero or negative base for power
+        # Avoid division by zero
         if final_val <= 0:
-            cagr = -1.0 # 100% loss
+            cagr = -1.0
         else:
             cagr = (final_val / START_CAPITAL) ** (1/YEARS) - 1
         

@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from quant_db_manager import MarketDB
 
-from strategy import MonthlyFortressStrategy, RSI2MeanReversionStrategy, CompositeStrategy
+from strategy import MonthlyFortressStrategy, RSI2MeanReversionStrategy, CompositeStrategy, CarryEngine
 
 from reports import (
     print_performance_report,
@@ -31,11 +31,17 @@ def backtest_monthly_fortress():
         exit_ma=5
     )
 
+    carry_engine = CarryEngine(top_n=5)
+
     strat = CompositeStrategy(
         main_strat=core_strat,
         sat_strat=satellite_strat,
-        main_weight=0.80
-    )
+        carry_engine=carry_engine,
+        main_weight=0.70,
+        sat_weight=0.10,
+        carry_weight=0.20
+)
+
 
     # ==========================================
     # LOAD DATA
