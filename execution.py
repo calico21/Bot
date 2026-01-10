@@ -9,10 +9,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# 1. Import ONLY the Gold Strategy
+# 1. Import Strategy
 from strategy import MonthlyFortressStrategy
 
-# 2. Import the Smart Calendar Logic
+# 2. Import Logic
 from execution_logic import is_rebalance_day
 
 # --- CONFIG ---
@@ -20,7 +20,7 @@ API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-PAPER_MODE = True  # Set to False for REAL MONEY
+PAPER_MODE = True
 
 # FILES
 LOG_FILE = "trade_history.csv"
@@ -32,22 +32,35 @@ trade_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
 
 # --- TELEGRAM FUNCTIONS ---
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    """Sends a text message to Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Telegram Token/Chat ID missing.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload)
-    except: pass
+    
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"❌ Telegram Error: {e}")
 
 def send_telegram_photo(image_path):
+    """Sends an image to Telegram."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not os.path.exists(image_path):
+        print(f"⚠️ Image not found: {image_path}")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     try:
         with open(image_path, 'rb') as photo:
             payload = {'chat_id': TELEGRAM_CHAT_ID}
             files = {'photo': photo}
             requests.post(url, data=payload, files=files)
+            print("✅ Dashboard sent to Telegram.")
     except Exception as e:
-        print(f"Failed to send photo: {e}")
+        print(f"❌ Failed to send photo: {e}")
 
 # --- PERFORMANCE TRACKING ---
 def get_performance_stats(current_equity):
@@ -60,7 +73,6 @@ def get_performance_stats(current_equity):
         total_chg = current_equity - start_equity
         total_pct = (total_chg / start_equity) * 100 if start_equity else 0.0
         
-        # Get yesterday's close
         if len(df) > 1:
             last_close = float(df.iloc[-2]['Equity'])
         else:
@@ -78,7 +90,6 @@ def update_performance_tracker(current_equity):
     
     if os.path.exists(PERF_FILE):
         df = pd.read_csv(PERF_FILE)
-        # Update today if exists, else append
         if not df.empty and df.iloc[-1]['Date'] == today_str:
             df.iloc[-1, df.columns.get_loc("Equity")] = float(current_equity)
         else:
@@ -88,9 +99,9 @@ def update_performance_tracker(current_equity):
     
     df.to_csv(PERF_FILE, index=False)
     
-    # Generate Chart
     if len(df) < 2: return None
     
+    # Generate Chart
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.set_index('Date')
     df['Peak'] = df['Equity'].cummax()
@@ -99,13 +110,11 @@ def update_performance_tracker(current_equity):
     plt.switch_backend('Agg') 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [2, 1]})
     
-    # Equity Curve
     ax1.plot(df.index, df['Equity'], color='#00ff00', linewidth=2)
-    ax1.set_title("Live Portfolio Performance", fontweight='bold', color='black')
+    ax1.set_title("Live Portfolio Performance", fontweight='bold')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylabel("Equity ($)")
     
-    # Drawdown
     ax2.fill_between(df.index, df['Drawdown'], 0, color='#ff0000', alpha=0.3)
     ax2.plot(df.index, df['Drawdown'], color='#ff0000', linewidth=1)
     ax2.set_title("Drawdown Risk (%)", fontsize=10)
@@ -147,10 +156,11 @@ def run_tracker_only():
 def execute_monthly_rebalance():
     print("--- 🚀 STARTING REBALANCE CHECK ---")
     
-    # 1. SMART CALENDAR CHECK (Replaces old manual checks)
-    # This logic determines if today is the First Trading Day of the month.
+    # 1. SMART CALENDAR CHECK
     if not is_rebalance_day(API_KEY, SECRET_KEY, paper=PAPER_MODE):
-        print("💤 Not a rebalance day. Exiting safely.")
+        print("💤 Not a rebalance day.")
+        # DEBUG: Force a message so you know it ran (Remove later if annoying)
+        send_telegram(f"💤 **Fortress Bot:** Market Closed / Not Rebalance Day. Sleeping.")
         return
 
     print("✅ Today is the First Trading Day! Executing Strategy.")
@@ -158,17 +168,14 @@ def execute_monthly_rebalance():
 
     # 2. STRATEGY EXECUTION
     strategy = MonthlyFortressStrategy()
-    
-    # Fetch Data (Using yfinance for robustness)
     tickers = list(set(strategy.risk_assets + strategy.safe_assets + ['SPY', 'IEF']))
+    
     print("📊 Downloading Market Data...")
     data = yf.download(tickers, period="2y", progress=False)
     
-    # Fix MultiIndex if present
     if isinstance(data.columns, pd.MultiIndex):
         data = data['Close']
         
-    # Generate Signal
     today = pd.Timestamp.today()
     target_portfolio = strategy.get_signal(data, today)
     target_dict = {t: w for t, w in target_portfolio}
@@ -182,7 +189,6 @@ def execute_monthly_rebalance():
     
     trade_log = []
     
-    # Get Live Prices for Sizing
     live_prices = {}
     for t in target_dict.keys():
         try:
@@ -191,7 +197,7 @@ def execute_monthly_rebalance():
         except:
             print(f"⚠️ Could not get price for {t}")
 
-    # A. SELL PHASE (Clear non-target assets)
+    # A. Sell
     for p in positions:
         if p.symbol not in target_dict:
             try:
@@ -200,16 +206,14 @@ def execute_monthly_rebalance():
             except Exception as e:
                 print(f"❌ Error selling {p.symbol}: {e}")
 
-    # B. BUY/ADJUST PHASE
-    # Use 95% of equity to leave buffer for slippage
+    # B. Buy
     target_equity = equity * 0.95
-    
     for symbol, weight in target_dict.items():
         if symbol not in live_prices: continue
         
         price = live_prices[symbol]
         target_val = target_equity * weight
-        if target_val < 100: continue # Skip dust
+        if target_val < 50: continue 
         
         target_qty = int(target_val / price)
         current_qty = current_holdings.get(symbol, 0)
@@ -238,7 +242,7 @@ def execute_monthly_rebalance():
     update_performance_tracker(equity)
     
     report = f"✅ **Rebalance Complete**\n💰 Equity: ${equity:,.2f}\n"
-    if trade_log: report += "\n".join(trade_log[:10]) # Limit msg size
+    if trade_log: report += "\n".join(trade_log[:10]) 
     else: report += "\n(Portfolio matches target)"
     
     send_telegram(report)
