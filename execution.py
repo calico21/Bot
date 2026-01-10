@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import requests
 import pandas as pd
 import yfinance as yf
@@ -153,18 +154,22 @@ def run_tracker_only():
     print("--- TRACKING COMPLETE ---")
 
 # --- MODE 2: REBALANCE (MONTHLY) ---
-def execute_monthly_rebalance():
+def execute_monthly_rebalance(force_trade=False):
     print("--- 🚀 STARTING REBALANCE CHECK ---")
     
     # 1. SMART CALENDAR CHECK
-    if not is_rebalance_day(API_KEY, SECRET_KEY, paper=PAPER_MODE):
-        print("💤 Not a rebalance day.")
-        # DEBUG: Force a message so you know it ran (Remove later if annoying)
-        send_telegram(f"💤 **Fortress Bot:** Market Closed / Not Rebalance Day. Sleeping.")
-        return
-
-    print("✅ Today is the First Trading Day! Executing Strategy.")
-    send_telegram("🚀 **Fortress Bot Activated**\nMarket Open. Analyzing Regime...")
+    # Logic: If force_trade is TRUE, we skip the calendar check.
+    if force_trade:
+        print("⚠️ FORCE MODE ENABLED: Skipping Calendar Check.")
+        send_telegram("⚠️ **Force Trade Activated**\nManual Override: Executing Strategy Immediately.")
+    else:
+        if not is_rebalance_day(API_KEY, SECRET_KEY, paper=PAPER_MODE):
+            print("💤 Not a rebalance day.")
+            # We removed the spammy 'Sleeping' message here. It will just be silent.
+            return
+        else:
+            print("✅ Today is the First Trading Day! Executing Strategy.")
+            send_telegram("🚀 **Fortress Bot Activated**\nMarket Open. Analyzing Regime...")
 
     # 2. STRATEGY EXECUTION
     strategy = MonthlyFortressStrategy()
@@ -249,7 +254,13 @@ def execute_monthly_rebalance():
     print("--- COMPLETE ---")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--track":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--track', action='store_true', help='Run in tracker mode (no trading)')
+    parser.add_argument('--force', action='store_true', help='Force trade ignoring calendar')
+    args = parser.parse_args()
+
+    if args.track:
         run_tracker_only()
     else:
-        execute_monthly_rebalance()
+        # Pass the force flag to the function
+        execute_monthly_rebalance(force_trade=args.force)
