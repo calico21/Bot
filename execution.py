@@ -146,18 +146,23 @@ def execute_monthly_rebalance():
             except Exception as e:
                 print(f"Error {symbol}: {e}")
 
-    # 6. Report
+    # 6. Report (FIXED: Shows ALL trades)
     report = f"✅ **Rebalance Complete**\n💰 Equity: ${equity:,.2f}\n\n"
+    
     if trade_log:
-        # Summarize to avoid hitting Telegram limits
-        report += "\n".join(trade_log[:15])
-        if len(trade_log) > 15: report += f"\n...and {len(trade_log)-15} more."
+        report += "\n".join(trade_log)
     else: 
         report += "No trades needed."
         
-    report += "\n\n**Top Bets:**\n" + "\n".join([f"• {s}: {w:.1%}" for s, w in sorted(target_dict.items(), key=lambda x: x[1], reverse=True)[:10]])
+    report += "\n\n**Current Targets:**\n" + "\n".join([f"• {s}: {w:.1%}" for s, w in sorted(target_dict.items(), key=lambda x: x[1], reverse=True)])
     
-    send_telegram(report)
+    # Safe Send (Split if message is too long for Telegram)
+    if len(report) > 4000:
+        send_telegram(report[:4000])
+        send_telegram(report[4000:])
+    else:
+        send_telegram(report)
+        
     print("--- COMPLETE ---")
 
 if __name__ == "__main__":
