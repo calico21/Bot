@@ -2,22 +2,19 @@ name: QuantBot Workflow
 
 on:
   schedule:
-    # 1. Daily Tracker: 21:30 UTC 
-    # (Winter: 30 mins after close. Summer: 1h 30m after close. ALWAYS SAFE.)
-    - cron: '30 21 * * 1-5' 
+    # 1. Daily Tracker: 21:30 UTC (Mon-Fri)
+    # Runs after market close to update the dashboard/CSV
+    - cron: '30 21 * * 1-5'
     
-    # 2. Rebalance Attempt A: 14:30 UTC 
-    # (Summer: 10:30 AM ET -> SAFE. Winter: 9:30 AM ET -> TOO EARLY, Script will skip.)
-    - cron: '30 14 1 * *' 
-    
-    # 3. Rebalance Attempt B: 15:30 UTC
-    # (Summer: 11:30 AM ET -> ALREADY TRADED, Script will skip. Winter: 10:30 AM ET -> SAFE.)
-    - cron: '30 15 1 * *'
+    # 2. Rebalance Check: 14:30 UTC (Mon-Fri)
+    # Runs EVERY weekday. Python decides if it's the "First Trading Day".
+    # (Winter: 9:30 AM ET / Summer: 10:30 AM ET)
+    - cron: '30 15 * * 1-5'
 
   workflow_dispatch: # Allows manual button click
 
 permissions:
-  contents: write # REQUIRED to save the CSV and Graph back to the repo
+  contents: write # REQUIRED to save CSVs/Images
 
 jobs:
   build:
@@ -43,38 +40,33 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Get current Hour (H) and Day (D)
+          # Get current Hour (H)
           H=$(date +%H)
-          D=$(date +%d)
 
-          # LOGIC:
-          # If Day is 01 AND Hour is 14 or 15 (UTC) -> Try Rebalance
-          if [ "$D" == "01" ] && ( [ "$H" == "14" ] || [ "$H" == "15" ] ); then
-            echo "📅 Monthly Rebalance Window (Hour $H UTC). Checking Market Status..."
-            python execution.py
-            
-          # Else if Hour is 21 (UTC) -> Run Tracker
+          # --- LOGIC UPDATE ---
+          # We removed the [ "$D" == "01" ] check.
+          # We now run every weekday and trust execution.py to check the calendar.
+
+          if [ "$H" == "14" ] || [ "$H" == "15" ]; then
+             echo "☀️ Morning Run (Hour $H UTC). Checking if today is Rebalance Day..."
+             # This script will now check is_rebalance_day().
+             # If FALSE -> It exits safely.
+             # If TRUE  -> It executes the trades.
+             python execution.py
+             
           elif [ "$H" == "21" ]; then
-            echo "📊 Daily Tracker Run."
-            python execution.py --track
-            
+             echo "🌙 Evening Run. Updating Tracker..."
+             python execution.py --track
+             
           else
-             echo "⚠️ Manual Run or Unknown Trigger. Running Tracker by default."
+             echo "⚠️ Manual Run. Defaulting to Tracker."
              python execution.py --track
           fi
 
-      # CRITICAL STEP: Commit the updated CSV and Graph back to GitHub
-      # Without this, your "Live Tracker" forgets everything every day!
       - name: Commit and Push Data
         run: |
           git config --global user.name "QuantBot"
           git config --global user.email "bot@quant.com"
-          
-          # Add the specific files we want to save
           git add trade_history.csv live_performance.csv live_dashboard.png || true
-          
-          # Commit if there are changes
           git commit -m "📈 Auto-update: Portfolio Tracker & Logs" || echo "No changes to commit"
-          
-          # Push back to repo
           git push
