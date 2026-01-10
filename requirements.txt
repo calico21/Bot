@@ -5,3 +5,4 @@ yfinance
 alpaca-py
 requests
 pyarrow
+matplotlib
