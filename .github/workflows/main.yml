@@ -3,18 +3,21 @@ name: QuantBot Workflow
 on:
   schedule:
     # 1. Daily Tracker: 21:30 UTC (Mon-Fri)
-    # Runs after market close to update the dashboard/CSV
     - cron: '30 21 * * 1-5'
     
-    # 2. Rebalance Check: 14:30 UTC (Mon-Fri)
-    # Runs EVERY weekday. Python decides if it's the "First Trading Day".
-    # (Winter: 9:30 AM ET / Summer: 10:30 AM ET)
+    # 2. Rebalance Check: 15:30 UTC (Mon-Fri)
     - cron: '30 15 * * 1-5'
 
-  workflow_dispatch: # Allows manual button click
+  workflow_dispatch:
+    inputs:
+      force_trade:
+        description: '⚠️ FORCE TRADE (Ignore Calendar)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
-  contents: write # REQUIRED to save CSVs/Images
+  contents: write
 
 jobs:
   build:
@@ -40,18 +43,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Get current Hour (H)
           H=$(date +%H)
-
-          # --- LOGIC UPDATE ---
-          # We removed the [ "$D" == "01" ] check.
-          # We now run every weekday and trust execution.py to check the calendar.
-
-          if [ "$H" == "14" ] || [ "$H" == "15" ]; then
-             echo "☀️ Morning Run (Hour $H UTC). Checking if today is Rebalance Day..."
-             # This script will now check is_rebalance_day().
-             # If FALSE -> It exits safely.
-             # If TRUE  -> It executes the trades.
+          
+          # --- CHECK FOR MANUAL OVERRIDE ---
+          if [ "${{ inputs.force_trade }}" == "true" ]; then
+             echo "⚠️ MANUAL FORCE TRADE INITIATED"
+             python execution.py --force
+             
+          # --- NORMAL SCHEDULED LOGIC ---
+          elif [ "$H" == "15" ]; then
+             echo "☀️ Prime Time. Checking Rebalance Logic..."
              python execution.py
              
           elif [ "$H" == "21" ]; then
@@ -59,7 +60,7 @@ jobs:
              python execution.py --track
              
           else
-             echo "⚠️ Manual Run. Defaulting to Tracker."
+             echo "⚠️ Manual Run (Default). Running Tracker."
              python execution.py --track
           fi
 
