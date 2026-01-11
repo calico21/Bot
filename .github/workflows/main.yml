@@ -2,11 +2,11 @@ name: QuantBot Workflow
 
 on:
   schedule:
-    # 1. Daily Tracker: 21:30 UTC (Mon-Fri)
-    - cron: '30 21 * * 1-5'
-    
-    # 2. Rebalance Check: 15:30 UTC (Mon-Fri)
+    # 1. Rebalance Check: 15:30 UTC (Mon-Fri)
     - cron: '30 15 * * 1-5'
+    
+    # 2. Daily Tracker: 21:30 UTC (Mon-Fri)
+    - cron: '30 21 * * 1-5'
 
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.13'
+          python-version: '3.10'
           
       - name: Install dependencies
         run: |
@@ -48,26 +48,26 @@ jobs:
           # --- CHECK FOR MANUAL OVERRIDE ---
           if [ "${{ inputs.force_trade }}" == "true" ]; then
              echo "⚠️ MANUAL FORCE TRADE INITIATED"
-             python execution.py --force
+             python live_bot.py --force
              
-          # --- NORMAL SCHEDULED LOGIC ---
-          elif [ "$H" == "15" ]; then
-             echo "☀️ Prime Time. Checking Rebalance Logic..."
-             python execution.py
-             
+          # --- DAILY TRACKER (21:30 UTC) ---
           elif [ "$H" == "21" ]; then
-             echo "🌙 Evening Run. Updating Tracker..."
-             python execution.py --track
+             echo "🌙 Evening Run. Sending Daily Report..."
+             python live_bot.py --track
              
+          # --- REBALANCE CHECK (15:30 UTC) ---
           else
-             echo "⚠️ Manual Run (Default). Running Tracker."
-             python execution.py --track
+             echo "☀️ Prime Time. Checking Rebalance Logic..."
+             python live_bot.py
           fi
 
-      - name: Commit and Push Data
+      - name: Commit and Push Logs
         run: |
           git config --global user.name "QuantBot"
           git config --global user.email "bot@quant.com"
-          git add trade_history.csv live_performance.csv live_dashboard.png || true
-          git commit -m "📈 Auto-update: Portfolio Tracker & Logs" || echo "No changes to commit"
+          
+          # Add all tracking files (History, Performance Data, and Dashboard Image)
+          git add trade_history.csv live_performance.csv dashboard.png || true
+          
+          git commit -m "📈 Auto-update: Portfolio Tracker & Charts" || echo "No changes to commit"
           git push
