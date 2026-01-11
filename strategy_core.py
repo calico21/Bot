@@ -1,0 +1,485 @@
+# strategy_core.py
+
+import pandas as pd
+import numpy as np
+import scipy.cluster.hierarchy as sch
+from scipy.spatial.distance import squareform
+from alpaca.trading.client import TradingClient
+from datetime import date, timedelta
+import warnings
+import json
+import os
+
+# Mute warnings
+warnings.filterwarnings("ignore")
+
+# ============================================================
+#  1. DEFAULT CONFIGURATION (Fallback / Seed)
+# ============================================================
+# These values are used ONLY if 'winner_dna.json' is missing.
+# (Currently set to your Run #292 Winner as a baseline)
+
+RISK_ASSETS = [
+    'XLK', 'SMH', 'QQQ', 'XLC', 'XLY',
+    'XLF', 'XLI', 'XHB', 'IYT', 'IYR',
+    'XLE', 'XLV', 'XLP', 'XLU', 'XLB',
+    'EEM', 'INDA', 'EWJ', 
+    'GLD', 'SLV', 'DBC', 'USO'
+]
+SAFE_ASSETS = ['IEF', 'SHV', 'GLD', 'DBC'] 
+MARKET_FILTER = 'SPY'
+BOND_BENCHMARK = 'IEF'
+
+# -- Default Params --
+LOOKBACK_SMA_TREND = 220           
+LOOKBACK_SMA_FAST = 40             
+CRASH_LOOKBACK = 20                
+CRASH_THRESHOLD = -0.10            
+
+MAX_SINGLE_ASSET_EXPOSURE = 0.58   
+MAX_PORTFOLIO_LEVERAGE = 2.26      
+TARGET_VOL_BULL = 0.21             
+TARGET_VOL_BEAR = 0.065            
+VOL_LOOKBACK = 65                  
+
+ANCHOR_WEIGHT_BASE = 0.25   
+ANCHOR_WEIGHT_BULL = 0.00   
+ANCHOR_WEIGHT_BEAR = 0.35          
+ANCHOR_WEIGHT_CRASH = 0.66         
+ANCHOR_WEIGHT_HIGH_VOL = 0.40
+
+MOMENTUM_WINDOW_1 = 60             
+MOMENTUM_WINDOW_2 = 140            
+MOMENTUM_WINDOW_3 = 180            
+TOP_N_ASSETS = 7                   
+
+SATELLITE_RSI_ENTRY = 30           
+SATELLITE_ZSCORE_ENTRY = -2.5      
+SATELLITE_ALLOCATION = 0.13        
+
+# ============================================================
+#  2. AUTOMATED CONFIGURATION LOADER (The Magic)
+# ============================================================
+DNA_FILE = "winner_dna.json"
+
+def load_optimized_params():
+    """Loads best parameters from JSON and overrides globals."""
+    if not os.path.exists(DNA_FILE):
+        print("⚠️ No winner_dna.json found. Using default hardcoded parameters.")
+        return
+
+    try:
+        with open(DNA_FILE, 'r') as f:
+            data = json.load(f)
+            params = data.get('params', {})
+        
+        # Mapping: JSON Key -> Global Variable Name
+        # If you add new params to optimizer, add them here!
+        mapping = {
+            'max_lev': 'MAX_PORTFOLIO_LEVERAGE',
+            'max_single': 'MAX_SINGLE_ASSET_EXPOSURE',
+            'anchor_crash': 'ANCHOR_WEIGHT_CRASH',
+            'sma_trend': 'LOOKBACK_SMA_TREND',
+            'sma_fast': 'LOOKBACK_SMA_FAST',
+            'crash_lb': 'CRASH_LOOKBACK',
+            'crash_thresh': 'CRASH_THRESHOLD',
+            'mom_w1': 'MOMENTUM_WINDOW_1',
+            'mom_w2': 'MOMENTUM_WINDOW_2',
+            'mom_w3': 'MOMENTUM_WINDOW_3',
+            'top_n': 'TOP_N_ASSETS',
+            'vol_bull': 'TARGET_VOL_BULL',
+            'vol_bear': 'TARGET_VOL_BEAR',
+            'vol_lb': 'VOL_LOOKBACK',
+            'sat_rsi': 'SATELLITE_RSI_ENTRY',
+            'sat_alloc': 'SATELLITE_ALLOCATION'
+        }
+
+        print(f"🧬 Injecting Optimized DNA (Score: {data.get('score',0):.4f})...")
+        for json_key, global_var in mapping.items():
+            if json_key in params:
+                # Update the global variable dynamically
+                globals()[global_var] = params[json_key]
+                # print(f"   -> Set {global_var} = {params[json_key]}") # Uncomment for debug
+                
+    except Exception as e:
+        print(f"❌ Error loading DNA file: {e}")
+
+# EXECUTE LOADER IMMEDIATELY
+load_optimized_params()
+
+# ============================================================
+#  3. CORE LOGIC (Standard Strategy Code)
+# ============================================================
+
+class MarketState:
+    def __init__(self, prices, date, market_ticker='SPY', bond_ticker='IEF'):
+        self.regime = "unknown"
+        self.leverage_scalar = 1.0
+        self.is_tail_risk = False
+        self.correlation_stress = False
+        
+        if market_ticker not in prices.columns: return
+        spy = prices[market_ticker].loc[:date].dropna()
+        if len(spy) < LOOKBACK_SMA_TREND: return
+
+        current_price = spy.iloc[-1]
+        rets_spy = spy.pct_change()
+        
+        vol_21 = rets_spy.tail(21).std() * np.sqrt(252)
+        vol_target_window = rets_spy.tail(VOL_LOOKBACK).std() * np.sqrt(252)
+        
+        sma50 = spy.rolling(LOOKBACK_SMA_FAST).mean().iloc[-1]
+        sma200 = spy.rolling(LOOKBACK_SMA_TREND).mean().iloc[-1]
+        
+        # Crash logic
+        if len(spy) > CRASH_LOOKBACK:
+            prior_crash_price = spy.iloc[-CRASH_LOOKBACK] 
+            crash_drawdown = (current_price / prior_crash_price) - 1
+        else:
+            crash_drawdown = 0
+
+        if crash_drawdown < CRASH_THRESHOLD: self.regime = "crash"
+        elif vol_21 > 0.20: self.regime = "high_vol"
+        elif current_price > sma50: self.regime = "bull"
+        elif current_price < sma200: self.regime = "bear"
+        else: self.regime = "bull"      
+
+        if (current_price < sma200 and vol_21 > (vol_target_window * 1.35)) or vol_21 > 0.30:
+            self.is_tail_risk = True
+
+        if self.regime in ["crash", "high_vol"] or vol_21 > 0.30:
+            self.leverage_scalar = 1.0
+        elif vol_21 > 0:
+            target_vol = TARGET_VOL_BULL if self.regime == "bull" else TARGET_VOL_BEAR
+            base_lev = target_vol / vol_21
+            cap = MAX_PORTFOLIO_LEVERAGE if self.regime == "bull" else 1.2
+            self.leverage_scalar = float(np.clip(base_lev, 0.5, cap))
+
+class FortressSubStrategy:
+    def __init__(self, name, vol_window, top_n, risk_assets=None):
+        self.name = name
+        self.vol_window = vol_window
+        self.top_n = top_n 
+        self.risk_assets = risk_assets or RISK_ASSETS
+
+    def _get_quasi_diag(self, link):
+        link = link.astype(int)
+        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+        num_items = link[-1, 3]
+        while sort_ix.max() >= num_items:
+            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
+            df0 = sort_ix[sort_ix >= num_items]
+            i = df0.index
+            j = df0.values - num_items
+            sort_ix[i] = link[j, 0]
+            df0 = pd.Series(link[j, 1], index=i + 1)
+            sort_ix = pd.concat([sort_ix, df0])
+            sort_ix = sort_ix.sort_index()
+            sort_ix.index = range(sort_ix.shape[0])
+        return sort_ix.tolist()
+
+    def _get_cluster_var(self, cov, c_items):
+        cov_slice = cov.iloc[c_items, c_items]
+        w = 1.0 / np.diag(cov_slice)
+        w /= w.sum()
+        return np.dot(np.dot(w, cov_slice), w)
+
+    def _get_rec_bipart(self, cov, sort_ix):
+        w = pd.Series(1.0, index=sort_ix)
+        c_items = [sort_ix]
+        while len(c_items) > 0:
+            c_items = [i[j:k] for i in c_items for j, k in ((0, len(i) // 2), (len(i) // 2, len(i))) if len(i) > 1]
+            for i in range(0, len(c_items), 2):
+                c_items0 = c_items[i]
+                c_items1 = c_items[i + 1]
+                c_var0 = self._get_cluster_var(cov, c_items0)
+                c_var1 = self._get_cluster_var(cov, c_items1)
+                alpha = 1 - c_var0 / (c_var0 + c_var1)
+                w[c_items0] *= alpha
+                w[c_items1] *= 1 - alpha
+        return w
+
+    def get_hrp_weights(self, returns_df):
+        valid_assets = list(returns_df.columns)
+        if len(valid_assets) < 2: 
+            return {t: 1.0/len(valid_assets) for t in valid_assets}
+        try:
+            cov = returns_df.cov()
+            corr = returns_df.corr()
+            dist = np.sqrt((1 - corr) / 2)
+            dist_array = squareform(dist)
+            link = sch.linkage(dist_array, 'ward') 
+            sort_ix = self._get_quasi_diag(link)
+            sort_ix = [returns_df.columns[i] for i in sort_ix]
+            cov = cov.loc[sort_ix, sort_ix]
+            weights = self._get_rec_bipart(cov, sort_ix)
+            return weights.to_dict()
+        except:
+            return {t: 1.0/len(valid_assets) for t in valid_assets}
+
+    def get_attack_portfolio(self, prices: pd.DataFrame, date: pd.Timestamp, regime: str):
+        valid_cols = [c for c in self.risk_assets if c in prices.columns]
+        hist = prices[valid_cols].loc[:date]
+        
+        # Use Global Momentum Windows
+        lookbacks = [MOMENTUM_WINDOW_1, MOMENTUM_WINDOW_2, MOMENTUM_WINDOW_3]
+        
+        momentum_scores = pd.Series(0.0, index=valid_cols)
+        valid_lb_counts = pd.Series(0.0, index=valid_cols)
+        recent_returns = hist.pct_change().tail(22).dropna()
+        if len(recent_returns) < 21: return {}
+        vol_21 = recent_returns.std()
+        current_prices = hist.iloc[-1]
+        
+        for lb in lookbacks:
+            if len(hist) > lb:
+                past_prices = hist.iloc[-(lb+1)]
+                moms = (current_prices / past_prices) - 1.0
+                safe_vols = vol_21.replace(0, np.inf)
+                scores = moms / safe_vols
+                momentum_scores += scores
+                valid_lb_counts += 1
+
+        final_scores = momentum_scores / valid_lb_counts.replace(0, 1)
+        final_scores = final_scores[valid_lb_counts > 0]
+        positive_assets = final_scores[final_scores > 0]
+        if positive_assets.empty: return {}
+
+        candidate_count = max(self.top_n, 5)
+        top_assets = positive_assets.nlargest(candidate_count).index.tolist()
+        if len(top_assets) == 1: return {top_assets[0]: 1.0}
+
+        subset_returns = hist[top_assets].iloc[-252:].pct_change().dropna()
+        hrp_weights = self.get_hrp_weights(subset_returns)
+
+        if regime == "bull":
+            tilted_weights = {}
+            total_score_sum = final_scores[top_assets].sum()
+            for t, w_hrp in hrp_weights.items():
+                if total_score_sum > 0:
+                    w_mom = final_scores[t] / total_score_sum
+                    tilted_weights[t] = (w_hrp * 0.5) + (w_mom * 0.5)
+                else: tilted_weights[t] = w_hrp
+            w_sum = sum(tilted_weights.values())
+            return {k: v/w_sum for k,v in tilted_weights.items()} if w_sum > 0 else hrp_weights
+        return hrp_weights
+
+class MeanReversionSatellite:
+    def __init__(self, universe):
+        self.universe = universe
+        self.lookback = 22        
+        self.max_positions = 3    
+
+    def get_zscore(self, series, window=20):
+        roll_mean = series.rolling(window).mean()
+        roll_std = series.rolling(window).std()
+        return (series - roll_mean) / roll_std
+
+    def calculate_rsi(self, series, period=2):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def get_signal(self, prices, date):
+        available = [t for t in self.universe if t in prices.columns]
+        if not available: return {}
+        data = prices[available].loc[:date].tail(self.lookback + 5)
+        if len(data) < self.lookback: return {}
+        candidates = {}
+        for ticker in available:
+            try:
+                series = data[ticker]
+                rsi = self.calculate_rsi(series, 2).iloc[-1]
+                zscore = self.get_zscore(series, 20).iloc[-1]
+                
+                if rsi < SATELLITE_RSI_ENTRY and zscore < SATELLITE_ZSCORE_ENTRY:
+                    candidates[ticker] = rsi + zscore 
+            except: continue
+        sorted_candidates = sorted(candidates.items(), key=lambda x: x[1])
+        top_picks = sorted_candidates[:self.max_positions]
+        weights = {}
+        if top_picks:
+            weight_each = 1.0 / len(top_picks)
+            for ticker, score in top_picks: weights[ticker] = weight_each
+        return weights
+
+# ============================================================
+#  4. MAIN STRATEGY LOGIC (FIXED & COMPLETE)
+# ============================================================
+
+class MonthlyFortressStrategy:
+    def __init__(self):
+        self.risk_assets = RISK_ASSETS
+        self.safe_assets = SAFE_ASSETS
+        self.market_filter = MARKET_FILTER
+        self.bond_benchmark = BOND_BENCHMARK
+        self.sub_strategies = [FortressSubStrategy("ensemble_core", 63, TOP_N_ASSETS)]
+        self.satellite_engine = MeanReversionSatellite(self.risk_assets)
+        
+        # --- CRITICAL FIX: Initialize satellite_assets ---
+        self.satellite_assets = [] 
+
+    def _is_asset_healthy(self, ticker, prices, date):
+        """Checks if an asset is trading above its 200-day SMA."""
+        if ticker not in prices.columns: return False
+        series = prices[ticker].loc[:date].dropna()
+        if len(series) < 200: return True 
+        sma200 = series.rolling(200).mean().iloc[-1]
+        return series.iloc[-1] > sma200
+
+    def _allocate_safe(self, target, prices, date):
+        """Distributes safe allocation, filling gaps with SHV/IEF if needed."""
+        final_target = {}
+        valid_targets = {t: w for t, w in target.items() if t in prices.columns and not pd.isna(prices.at[date, t])}
+        total_valid_weight = sum(valid_targets.values())
+        missing_weight = 1.0 - total_valid_weight
+        final_target = valid_targets.copy()
+        
+        if missing_weight > 0.01:
+            # Fallback to SHV (Cash) or IEF (Bonds) if target safe asset is missing
+            if 'SHV' in prices.columns: 
+                final_target['SHV'] = final_target.get('SHV', 0) + missing_weight
+            elif 'IEF' in prices.columns: 
+                final_target['IEF'] = final_target.get('IEF', 0) + missing_weight
+                
+        return list(final_target.items())
+
+    def _get_adaptive_defense(self, prices, date):
+        """Selects the best performing safe assets (Momentum filter on Defense)."""
+        candidates = [t for t in self.safe_assets if t in prices.columns]
+        scores = {}
+        for t in candidates:
+            if t == 'SHV': 
+                scores[t] = 0.0 
+                continue
+            series = prices[t].loc[:date].dropna()
+            if len(series) < 63: continue
+            p_now = series.iloc[-1]
+            # Average momentum over 1, 3, and 6 months
+            r1 = (p_now / series.iloc[-21]) - 1 if len(series) > 21 else 0
+            r3 = (p_now / series.iloc[-63]) - 1 if len(series) > 63 else 0
+            r6 = (p_now / series.iloc[-126]) - 1 if len(series) > 126 else 0
+            scores[t] = (r1 + r3 + r6) / 3.0
+            
+        # Select top assets
+        valid_assets = {k: v for k, v in scores.items() if v > 0 or k == 'SHV'}
+        top_assets = sorted(valid_assets, key=valid_assets.get, reverse=True)[:2]
+        
+        if not top_assets or (top_assets[0] != 'SHV' and scores.get(top_assets[0], -1) < 0.0):
+            return [('SHV', 1.0)] # Cash is king if everything is falling
+            
+        if len(top_assets) == 1: 
+            return [(top_assets[0], 1.0)]
+        else: 
+            return [(top_assets[0], 0.60), (top_assets[1], 0.40)]
+
+    def _get_defense_portfolio(self, prices, date, regime):
+        return self._get_adaptive_defense(prices, date)
+
+    def _get_anchor_weight_for_regime(self, regime: str) -> float:
+        if regime == "bull": return ANCHOR_WEIGHT_BULL
+        if regime == "bear": return ANCHOR_WEIGHT_BEAR
+        if regime == "crash": return ANCHOR_WEIGHT_CRASH
+        if regime == "high_vol": return ANCHOR_WEIGHT_HIGH_VOL
+        return ANCHOR_WEIGHT_BASE
+
+    def detect_regime(self, prices: pd.DataFrame, date: pd.Timestamp) -> str:
+        state = MarketState(prices, date, self.market_filter, self.bond_benchmark)
+        return state.regime
+
+    def get_signal(self, prices: pd.DataFrame, date: pd.Timestamp):
+        """
+        Master Signal Generation Logic.
+        Returns a list of (ticker, weight) tuples.
+        """
+        state = MarketState(prices, date, self.market_filter, self.bond_benchmark)
+        core_portfolio = {}
+
+        # 1. EMERGENCY CHECK: Tail Risk
+        if state.is_tail_risk:
+            # Force 100% Cash/Safety immediately
+            safe_alloc = dict(self._allocate_safe({'SHV': 1.0}, prices, date))
+            return list(safe_alloc.items())
+
+        # 2. DEFENSIVE REGIMES
+        elif state.regime in ["crash", "bear", "high_vol", "unknown"]:
+            core_portfolio = dict(self._get_adaptive_defense(prices, date))
+        
+        # 3. OFFENSIVE REGIMES (Bull)
+        else:
+            s = self.sub_strategies[0]
+            raw_attack = s.get_attack_portfolio(prices, date, state.regime)
+            
+            if not raw_attack:
+                # Fallback to defense if no assets pass momentum filter
+                core_portfolio = dict(self._get_defense_portfolio(prices, date, "bear"))
+            else:
+                # Apply Anchor (Cash/Hedge) Weight
+                anchor_weight = self._get_anchor_weight_for_regime(state.regime)
+                for t, w in raw_attack.items(): 
+                    core_portfolio[t] = w * (1 - anchor_weight)
+                
+                # Fill Anchor Bucket
+                if anchor_weight > 0:
+                    anchor_ief = anchor_weight * 0.5
+                    anchor_gld = anchor_weight * 0.5
+                    
+                    # Smart Anchor: Don't buy IEF if it's crashing; buy SHV instead
+                    if not self._is_asset_healthy('IEF', prices, date):
+                        core_portfolio['SHV'] = core_portfolio.get('SHV', 0) + anchor_ief
+                    else:
+                        core_portfolio['IEF'] = core_portfolio.get('IEF', 0) + anchor_ief
+                        
+                    core_portfolio['GLD'] = core_portfolio.get('GLD', 0) + anchor_gld
+                
+                # Apply Leverage
+                lev = state.leverage_scalar
+                if state.correlation_stress: 
+                    lev = min(lev, 1.0) # Cut leverage if correlations spike
+                    
+                core_portfolio = {k: v * lev for k, v in core_portfolio.items()}
+                
+                # Apply Single Asset Caps
+                for t in core_portfolio:
+                    if core_portfolio[t] > MAX_SINGLE_ASSET_EXPOSURE:
+                        core_portfolio[t] = MAX_SINGLE_ASSET_EXPOSURE
+
+        # 4. SATELLITE ENGINE (Dip Buying)
+        satellite_pct = SATELLITE_ALLOCATION
+        core_pct = 1.0 - satellite_pct
+        sat_weights = self.satellite_engine.get_signal(prices, date)
+        
+        # Merge Core + Satellite
+        final_portfolio = {}
+        for t, w in core_portfolio.items(): 
+            final_portfolio[t] = w * core_pct
+            
+        if sat_weights:
+            for t, w in sat_weights.items():
+                final_portfolio[t] = final_portfolio.get(t, 0.0) + (w * satellite_pct)
+        else:
+            # If no satellite signals, give weight back to Core
+            if core_pct > 0:
+                scale_factor = 1.0 / core_pct
+                final_portfolio = {t: w * scale_factor for t, w in final_portfolio.items()}
+
+        # 5. FINAL LEVERAGE SAFETY CHECK
+        total_exposure = sum(final_portfolio.values())
+        if total_exposure > MAX_PORTFOLIO_LEVERAGE:
+            scale_factor = MAX_PORTFOLIO_LEVERAGE / total_exposure
+            final_portfolio = {k: v * scale_factor for k, v in final_portfolio.items()}
+            
+        return list(final_portfolio.items())
+
+def is_rebalance_day(api_key, secret_key, paper=True):
+    trading_client = TradingClient(api_key, secret_key, paper=paper)
+    clock = trading_client.get_clock()
+    if not clock.is_open: return False
+    today = date.today()
+    start_date = today.replace(day=1)
+    calendar = trading_client.get_calendar(start=start_date, end=today.replace(day=28) + timedelta(days=4))
+    trading_days = [day.date for day in calendar]
+    if today == trading_days[0]: return True
+    else: return False
