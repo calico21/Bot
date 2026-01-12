@@ -1,44 +1,42 @@
 PS C:\Users\alexr\Quant\Model V2> & C:\Users\alexr\AppData\Local\Programs\Python\Python313\python.exe "c:/Users/alexr/Quant/Model V2/backtest_engine.py"
-🧬 Injecting Optimized DNA (Score: 0.1114)...
+🧬 Injecting Optimized DNA (Score: 0.1926)...
 
 === BASELINE BACKTEST (Capital: $100,000) ===
 
 === PERFORMANCE REPORT: Baseline ===
 Period: 2000-01-31 -> 2025-12-31
-CAGR:           15.18%
-Max Drawdown:   -21.26%
-Sharpe Ratio:   1.25
-Sortino Ratio:  1.64
-Final Equity:   $3,890,903.15
+CAGR:           16.67%
+Max Drawdown:   -18.25%
+Sharpe Ratio:   1.34
+Sortino Ratio:  1.96
+Final Equity:   $5,436,560.66
 
 📊 Generating 6 Charts into 'reports/' folder...
   • Generating Performance Chart...
   • Generating Dashboard...
-  • Running Monte Carlo (1000 sims)...
+  • Running Monte Carlo (100000 sims)...
   • Generating Distribution Analysis...
   • Generating Efficiency Map...
   • Generating Regime Timeline...
 
 ✅ Done! Check the 'reports' folder.
 PS C:\Users\alexr\Quant\Model V2> python research_lab.py --mode stress
-🧬 Injecting Optimized DNA (Score: 0.1114)...
+🧬 Injecting Optimized DNA (Score: 0.1926)...
 
-🎲 Running BLOCK BOOTSTRAP Stress Test (2000 simulations)...
+🎲 Running BLOCK BOOTSTRAP Stress Test (100000 simulations)...
 ========================================
  🎲 MONTE CARLO STRESS TEST RESULTS
 ========================================
 
 --- GROWTH (CAGR) ---
-Worst Case (1%):    12.30%
-Bad Case (10%):     16.11%
-Median Case (50%):  21.31%
-Best Case (90%):    26.68%
+Bad Case (10%):     18.24%
+Median Case (50%):  23.71%
+Best Case (90%):    29.03%
 
 --- RISK (Max Drawdown) ---
-Median Drawdown:    -21.56%
-Worst 1% Case:      -36.45%
+Median Drawdown:    -19.69%
+Worst 1% Case:      -34.93%
 
 --- SURVIVAL ---
 Risk of Ruin (>70% Loss): 0.00%
 ----------------------------------------
-PS C:\Users\alexr\Quant\Model V2> 
