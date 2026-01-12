@@ -2,10 +2,10 @@ name: QuantBot Workflow
 
 on:
   schedule:
-    # 1. Rebalance Check: 15:30 UTC (Mon-Fri)
+    # 1. Rebalance Check: 15:30 UTC = 16:30 CET (1 hour after US Open)
     - cron: '30 15 * * 1-5'
     
-    # 2. Daily Tracker: 21:30 UTC (Mon-Fri)
+    # 2. Daily Tracker: 21:30 UTC = 22:30 CET (30 mins after US Close)
     - cron: '30 21 * * 1-5'
 
   workflow_dispatch:
@@ -22,6 +22,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Safety: Kill job if it freezes
     
     steps:
       - name: Checkout code
@@ -31,6 +32,7 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip' # Speeds up installation
           
       - name: Install dependencies
         run: |
@@ -66,8 +68,15 @@ jobs:
           git config --global user.name "QuantBot"
           git config --global user.email "bot@quant.com"
           
-          # Add all tracking files (History, Performance Data, and Dashboard Image)
+          # Add tracking files
           git add trade_history.csv live_performance.csv dashboard.png || true
           
-          git commit -m "📈 Auto-update: Portfolio Tracker & Charts" || echo "No changes to commit"
-          git push
+          # Check for changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "📈 Auto-update: Portfolio Tracker & Charts"
+            # PULL before pushing to prevent conflict errors
+            git pull --rebase origin main
+            git push
+          fi
