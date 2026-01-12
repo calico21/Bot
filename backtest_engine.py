@@ -20,6 +20,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # --- CONFIGURATION ---
 START_CAPITAL = 100_000
 SLIPPAGE_PER_TURNOVER = 0.001  # 10 bps
+CIRCUIT_BREAKER_THRESHOLD = -0.045 # -4.5% Daily Loss Limit
 OUTPUT_DIR = "reports"         # Folder for charts
 
 # Create reports folder if it doesn't exist
@@ -85,7 +86,7 @@ def print_performance_report(equity_curve, benchmark_curve=None, name="Strategy"
 def run_full_strategy_backtest(strat_override=None):
     """
     Runs the simulation using the Strategy Class and Data Manager.
-    Returns: equity_series, turnover_series, prices_df, strategy_instance
+    NOW INCLUDES: Daily Circuit Breaker Simulation.
     """
     db = MarketDB()
     strat = strat_override or MonthlyFortressStrategy()
@@ -146,27 +147,71 @@ def run_full_strategy_backtest(strat_override=None):
     current_portfolio = {}
     last_prices = {}
     turnover_series = []
+    
+    # Track the previous month's date for daily slicing
+    prev_date = None
 
     for date in monthly_dates:
         if date not in prices.index: continue
         
-        # Get Signal
+        # --- A. CALCULATE RETURNS (With Circuit Breaker) ---
+        port_ret = 0.0
+        circuit_triggered = False
+
+        if current_portfolio and prev_date:
+            # 1. Standard Monthly Return Calculation (Default)
+            monthly_port_ret = 0.0
+            
+            # 2. VIRTUAL CIRCUIT BREAKER CHECK
+            # We must scan every day between prev_date and date to see if we crashed.
+            daily_slice = prices.loc[prev_date:date]
+            
+            if not daily_slice.empty and len(daily_slice) > 1:
+                # Reconstruct daily portfolio value for this month
+                # Normalize prices to start of month = 1.0
+                daily_vals = pd.Series(0.0, index=daily_slice.index)
+                start_prices = daily_slice.iloc[0]
+                
+                valid_assets = [t for t in current_portfolio if t in daily_slice.columns]
+                for t in valid_assets:
+                    w = current_portfolio[t]
+                    if start_prices[t] > 0:
+                        daily_vals += (daily_slice[t] / start_prices[t]) * w
+                
+                # Calculate daily % change of the portfolio
+                daily_pct_change = daily_vals.pct_change().dropna()
+                
+                # Check for crash
+                for d, ret in daily_pct_change.items():
+                    if ret < CIRCUIT_BREAKER_THRESHOLD: # e.g., < -3%
+                        #print(f"⚡ Circuit Breaker Triggered on {d.date()}: {ret:.2%} Drop")
+                        circuit_triggered = True
+                        
+                        # LOGIC: We sell at the close of this bad day.
+                        # Return is the change from Month Start -> Crash Day Close
+                        port_ret = (daily_vals.loc[d] / daily_vals.iloc[0]) - 1.0
+                        break # Stop checking, we are now in Cash for rest of month
+            
+            # 3. If NO Crash, use standard monthly calculation
+            if not circuit_triggered:
+                for t, w in current_portfolio.items():
+                    if t in prices.columns:
+                        price_today = prices[t].loc[date]
+                        price_then = last_prices.get(t)
+                        if price_then and not pd.isna(price_today):
+                            asset_ret = price_today / price_then - 1.0
+                            port_ret += w * asset_ret
+        
+        # Apply Return
+        equity *= (1.0 + port_ret)
+
+        # --- B. GENERATE NEW SIGNAL ---
+        # If we crashed, we are technically in cash, but for the simulation,
+        # we let the strategy regenerate weights for the NEXT month as normal.
         target_list = strat.get_signal(prices, date)
         target_dict = {t: w for t, w in target_list}
 
-        # Calculate PnL
-        if current_portfolio and last_prices:
-            port_ret = 0.0
-            for t, w in current_portfolio.items():
-                if t in prices.columns:
-                    price_today = prices[t].loc[date]
-                    price_then = last_prices.get(t)
-                    if price_then and not pd.isna(price_today):
-                        asset_ret = price_today / price_then - 1.0
-                        port_ret += w * asset_ret
-            equity *= (1.0 + port_ret)
-
-        # Calculate Turnover & Slippage
+        # --- C. TURNOVER & SLIPPAGE ---
         all_tickers = set(current_portfolio.keys()) | set(target_dict.keys())
         gross_turnover = 0.0
         for t in all_tickers:
@@ -181,6 +226,7 @@ def run_full_strategy_backtest(strat_override=None):
         # Update State
         current_portfolio = target_dict
         last_prices = {t: prices[t].loc[date] for t in current_portfolio.keys()}
+        prev_date = date # Update previous date pointer
         
         equity_curve.append(equity)
         equity_dates.append(date)
@@ -194,13 +240,22 @@ def run_full_strategy_backtest(strat_override=None):
 def plot_comparisons(base_equity):
     print("  • Generating Performance Chart...")
     db = MarketDB()
-    spy_price = db.load_data(['SPY'])['SPY']
+    try:
+        spy_price = db.load_data(['SPY'])['SPY']
+    except: # Fallback if SPY not in DB
+        spy_price = yf.download("SPY", start=base_equity.index[0], progress=False)['Close']
     db.close()
     
     start_date = base_equity.index[0]
     spy_curve = spy_price.loc[start_date:]
+    # Rebase SPY to match Strategy Start Capital
     spy_curve = spy_curve / spy_curve.iloc[0] * START_CAPITAL
     
+    # Align dates
+    common_idx = base_equity.index.intersection(spy_curve.index)
+    base_equity = base_equity.loc[common_idx]
+    spy_curve = spy_curve.loc[common_idx]
+
     plt.figure(figsize=(12, 10))
     
     # Plot 1: Equity
@@ -229,18 +284,16 @@ def plot_comparisons(base_equity):
     
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "chart_1_performance_comparison.png"), dpi=300)
-    plt.close() # Close plot to free memory
+    plt.close()
 
 def plot_advanced_dashboard(base_equity):
     print("  • Generating Dashboard...")
+    
+    # Re-fetch SPY for annual comparison
     db = MarketDB()
     spy_price = db.load_data(['SPY'])['SPY']
     db.close()
     
-    start_date = base_equity.index[0]
-    spy_curve = spy_price.loc[start_date:]
-    spy_curve = spy_curve / spy_curve.iloc[0] * START_CAPITAL
-
     strat_rets = base_equity.pct_change().dropna()
     
     fig = plt.figure(figsize=(14, 18), constrained_layout=True)
@@ -269,11 +322,13 @@ def plot_advanced_dashboard(base_equity):
     # 3. Annual Returns
     ax3 = fig.add_subplot(gs[2])
     strat_y = base_equity.resample('YE').last().pct_change()
-    spy_y = spy_curve.resample('YE').last().pct_change()
+    spy_y = spy_price.resample('YE').last().pct_change()
+    
+    # Intersect years
     common = sorted(list(set(strat_y.index.year) & set(spy_y.index.year)))
     
-    s_vals = [strat_y[strat_y.index.year == y].iloc[0] for y in common]
-    b_vals = [spy_y[spy_y.index.year == y].iloc[0] for y in common]
+    s_vals = [strat_y[strat_y.index.year == y].iloc[0] if not strat_y[strat_y.index.year == y].empty else 0 for y in common]
+    b_vals = [spy_y[spy_y.index.year == y].iloc[0] if not spy_y[spy_y.index.year == y].empty else 0 for y in common]
     x = np.arange(len(common))
     
     ax3.bar(x - 0.175, s_vals, 0.35, label='Strategy', color='#1f77b4')
@@ -287,7 +342,7 @@ def plot_advanced_dashboard(base_equity):
     plt.savefig(os.path.join(OUTPUT_DIR, "chart_2_dashboard.png"), dpi=300)
     plt.close()
 
-def plot_monte_carlo(equity_curve, n_sims=1000):
+def plot_monte_carlo(equity_curve, n_sims=100000):
     print(f"  • Running Monte Carlo ({n_sims} sims)...")
     rets = equity_curve.pct_change().dropna().values
     n_days = len(rets)
@@ -320,9 +375,9 @@ def plot_distribution_analysis(equity_curve):
     monthly_rets = equity_curve.resample('ME').last().pct_change(fill_method=None).dropna() * 100
     
     plt.figure(figsize=(12, 6))
-    sns.histplot(monthly_rets, kde=True, bins=45, color='#0052cc', alpha=0.6, log_scale=(False, True))
+    sns.histplot(monthly_rets, kde=True, bins=45, color='#0052cc', alpha=0.6, log_scale=(False, False)) # Log scale often breaks on negative values
     plt.axvline(0, color='black', linestyle='--')
-    plt.title("Monthly Return Distribution (Log Scale)", fontweight='bold')
+    plt.title("Monthly Return Distribution", fontweight='bold')
     plt.grid(True, alpha=0.3)
     
     plt.savefig(os.path.join(OUTPUT_DIR, "chart_4_distribution.png"), dpi=300)
@@ -332,7 +387,9 @@ def plot_yearly_efficiency(equity_curve):
     print("  • Generating Efficiency Map...")
     yearly_rets = equity_curve.resample('YE').last().pct_change(fill_method=None).dropna()
     daily_rets = equity_curve.pct_change(fill_method=None).dropna()
-    yearly_vol = daily_rets.groupby(daily_rets.index.year).std() * np.sqrt(252)
+    
+    # Approx yearly vol from monthly data
+    yearly_vol = daily_rets.groupby(daily_rets.index.year).std() * np.sqrt(12) 
     
     yearly_rets.index = yearly_rets.index.year
     common = sorted(list(set(yearly_rets.index) & set(yearly_vol.index)))
@@ -345,7 +402,7 @@ def plot_yearly_efficiency(equity_curve):
     for yr, xv, yv in zip(common, x, y):
         plt.text(xv, yv+2, str(yr), ha='center', fontsize=8)
         
-    plt.xlabel("Volatility %")
+    plt.xlabel("Volatility % (Approx)")
     plt.ylabel("Return %")
     plt.title("Yearly Risk vs Reward", fontweight='bold')
     plt.grid(True, alpha=0.3)
@@ -355,7 +412,11 @@ def plot_yearly_efficiency(equity_curve):
 
 def plot_regime_timeline(prices, strat, equity_curve):
     print("  • Generating Regime Timeline...")
-    regimes = [strat.detect_regime(prices, d) for d in equity_curve.index]
+    regimes = []
+    # Only calculate regime for dates where we have enough history
+    for d in equity_curve.index:
+        regimes.append(strat.detect_regime(prices, d))
+        
     regime_series = pd.Series(regimes, index=equity_curve.index)
     
     colors = {"bull": "#d9f0a3", "bear": "#fcbba1", "high_vol": "#fecc5c", "crash": "#cb181d", "unknown": "#f0f0f0"}
@@ -363,7 +424,8 @@ def plot_regime_timeline(prices, strat, equity_curve):
     plt.figure(figsize=(12, 5))
     for reg, col in colors.items():
         mask = (regime_series == reg)
-        plt.fill_between(regime_series.index, 0, 1, where=mask, color=col, alpha=0.5, transform=plt.gca().get_xaxis_transform(), label=reg.upper())
+        if mask.sum() > 0:
+            plt.fill_between(regime_series.index, 0, 1, where=mask, color=col, alpha=0.5, transform=plt.gca().get_xaxis_transform(), label=reg.upper())
         
     norm_eq = (equity_curve / equity_curve.max()) * 0.8 + 0.1
     plt.plot(equity_curve.index, norm_eq, color='#0052cc', label="Equity")
@@ -388,7 +450,7 @@ if __name__ == "__main__":
     print(f"\n📊 Generating 6 Charts into '{OUTPUT_DIR}/' folder...")
     plot_comparisons(base_equity)         
     plot_advanced_dashboard(base_equity)  
-    plot_monte_carlo(base_equity, n_sims=1000) 
+    plot_monte_carlo(base_equity, n_sims=100000) 
     plot_distribution_analysis(base_equity) 
     plot_yearly_efficiency(base_equity)     
     plot_regime_timeline(prices, strat, base_equity)

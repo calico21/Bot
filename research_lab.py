@@ -1,4 +1,4 @@
-# research_lab.py (FIXED CRASH THRESHOLD LOGIC)
+# research_lab.py (FIXED: Saves Charts to 'reports/' folder)
 
 import argparse
 import optuna
@@ -23,6 +23,11 @@ warnings.filterwarnings("ignore")
 
 STATE_FILE = "winner_dna.json"
 DB_FILE = "sqlite:///optimization.db"
+OUTPUT_DIR = "reports"  # Folder for saving charts
+
+# Ensure output directory exists
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
 # ==============================================================================
 # 1. ANALYTICAL UTILITIES
@@ -95,6 +100,7 @@ def block_bootstrap_sampling(returns, n_sims=2000, block_size=63, years=20):
         cagr_results.append(cagr)
 
     return dd_results, cagr_results
+
 # ==============================================================================
 # 2. PERSISTENCE LAYER
 # ==============================================================================
@@ -128,7 +134,7 @@ def save_new_winner(study, best_trial):
 # ============================
 # 3. OPTIMIZATION LOOP
 # ============================
-def run_optimization(trials=500):
+def run_optimization(trials=1000):
     print(f"\n🛡️ STARTING CONTINUOUS OPTIMIZATION ({trials} trials)...")
     print("Objective: 70% Real Performance (Test) + 30% Historical (Train)")
     
@@ -157,8 +163,6 @@ def run_optimization(trials=500):
             
             # Crash: FIXED ORDER (Low, High)
             crash_c = anchor.get('crash_thresh', -0.10)
-            # Low bound is the MORE negative number (e.g., -0.15)
-            # High bound is the LESS negative number (e.g., -0.05)
             strategy.CRASH_THRESHOLD = trial.suggest_float('crash_thresh', max(-0.15, crash_c - 0.02), min(-0.05, crash_c + 0.02))
             
             # Volatility: +/- 0.02
@@ -342,14 +346,17 @@ def run_visualization():
     ax.grid(False)
     ax.axis('off')
 
-    plt.show()
-    print("Done.")
+    # SAVE TO FILE INSTEAD OF SHOW
+    save_path = os.path.join(OUTPUT_DIR, "chart_8_optimization_radar.png")
+    plt.savefig(save_path, dpi=300)
+    print(f"🎨 3D Radar Chart saved to: {save_path}")
+    plt.close()
 
 # ============================
 # 5. TOOL: STRESS TEST
 # ============================
 def run_stress_test(params=None):
-    print(f"\n🎲 Running BLOCK BOOTSTRAP Stress Test ({2000} simulations)...")
+    print(f"\n🎲 Running BLOCK BOOTSTRAP Stress Test ({100000} simulations)...")
     
     # --- 1. Inject Parameters (Same as before) ---
     if params:
@@ -413,7 +420,7 @@ def run_stress_test(params=None):
     print(f"Risk of Ruin (>70% Loss): {ruin_prob:.2%}")
     print("-" * 40)
     
-    # --- 6. Plotting (Optional: Plot CAGR vs Drawdown) ---
+    # --- 6. Plotting (Saved to 'reports/') ---
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=dd_results, y=cagr_results, alpha=0.3, color="blue", s=10)
     plt.xlabel("Max Drawdown")
@@ -423,7 +430,12 @@ def run_stress_test(params=None):
     plt.axhline(cagr_median, color='green', linestyle='--', label='Median CAGR')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.show()
+    
+    # SAVE TO FILE INSTEAD OF SHOW
+    save_path = os.path.join(OUTPUT_DIR, "chart_7_stress_test.png")
+    plt.savefig(save_path, dpi=300)
+    print(f"📊 Stress Test Chart saved to: {save_path}")
+    plt.close()
 
 # ============================
 # MAIN ENTRY POINT
