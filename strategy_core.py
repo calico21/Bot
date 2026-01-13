@@ -5,6 +5,7 @@ import numpy as np
 import scipy.cluster.hierarchy as sch
 from scipy.spatial.distance import squareform
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetCalendarRequest
 from datetime import date, timedelta
 import warnings
 import json
@@ -479,7 +480,9 @@ def is_rebalance_day(api_key, secret_key, paper=True):
     if not clock.is_open: return False
     today = date.today()
     start_date = today.replace(day=1)
-    calendar = trading_client.get_calendar(start=start_date, end=today.replace(day=28) + timedelta(days=4))
-    trading_days = [day.date for day in calendar]
+    end_date = (today.replace(day=28) + timedelta(days=10)).replace(day=4).date()
+    calendar_request = GetCalendarRequest(start=start_date, end=end_date)
+    calendar = trading_client.get_calendar(filters=calendar_request)    trading_days = [day.date for day in calendar]
     if today == trading_days[0]: return True
+
     else: return False
