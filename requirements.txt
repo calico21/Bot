@@ -1,9 +1,9 @@
-alpaca-py
+alpaca
 matplotlib
 numpy
 optuna
 pandas
-requests
+Requests
 scipy
 seaborn
 yfinance

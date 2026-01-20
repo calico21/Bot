@@ -1,4 +1,4 @@
-# research_lab.py (FIXED: Saves Charts to 'reports/' folder)
+# research_lab.py
 
 import argparse
 import optuna
@@ -23,44 +23,66 @@ warnings.filterwarnings("ignore")
 
 STATE_FILE = "winner_dna.json"
 DB_FILE = "sqlite:///optimization.db"
-OUTPUT_DIR = "reports"  # Folder for saving charts
+OUTPUT_DIR = "reports" 
 
 # Ensure output directory exists
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 # ==============================================================================
-# 1. ANALYTICAL UTILITIES
+# 1. ANALYTICAL UTILITIES (The "Antifragile" Upgrade)
 # ==============================================================================
 
-def calculate_smart_score(equity_curve):
-    """Calculates weighted utility score."""
-    if len(equity_curve) < 12: return -999.0
+def calculate_smart_score(equity_curve, turnover_series=None):
+    """
+    Upgraded Objective Function: 'Antifragile Score'
+    Rewards: Growth, Smoothness
+    Penalties: Deep Drawdowns (Ulcer), Stagnation, High Turnover
+    """
+    # FIX: Changed from 252 (Days) to 12 (Months) to handle monthly backtest data
+    if len(equity_curve) < 52: return -999.0
     
+    # 1. Base Metrics
     cagr = research.calculate_cagr(equity_curve)
-    rets = equity_curve.pct_change().dropna()
-    downside_std = rets[rets < 0].std() * np.sqrt(12)
     
-    if downside_std == 0: return -999.0
+    # 2. Risk Metric: Ulcer Index
+    roll_max = equity_curve.cummax()
+    drawdowns = (equity_curve / roll_max - 1.0) * 100
+    ulcer_index = np.sqrt((drawdowns**2).mean())
     
-    sortino = (cagr / downside_std)
-    dd = research.calculate_max_drawdown(equity_curve)
+    if ulcer_index == 0: ulcer_index = 0.1 # Avoid div/0
     
-    # Utility: Sortino * Log(Growth)
-    utility = sortino * np.log1p(max(0, cagr))
+    # 3. Base Utility (Risk-Adjusted Return)
+    score = (cagr * 100) / ulcer_index
     
-    # Smooth Penalty for Drawdown
-    penalty_factor = 1.0
-    if dd < -0.15:
-        excess_dd = abs(dd) - 0.15
-        penalty_factor = max(0.0, 1.0 - (excess_dd * 3.5))
+    # 4. Critical Penalties
+    max_dd = drawdowns.min() / 100.0
+    
+    # A. Catastrophe Penalty (Exponential decay if DD > 25%)
+    if max_dd < -0.25:
+        score *= 0.5
+    if max_dd < -0.40:
+        score = -10.0 # Instant fail
+        
+    # B. Turnover Penalty (If available)
+    if turnover_series is not None:
+        avg_monthly_turnover = turnover_series.mean()
+        # If turnover > 80% per month, penalize score
+        if avg_monthly_turnover > 0.80:
+            score *= 0.85
+            
+    # C. Stagnation Penalty (Time underwater)
+    deep_pain_time = (drawdowns < -10).mean()
+    if deep_pain_time > 0.50:
+        score -= 2.0
 
-    final_score = utility * penalty_factor
-    if cagr < 0: return dd 
-    return final_score
+    if cagr < 0: return max_dd # If losing money, score is just the drawdown
+    
+    return score
 
 def block_bootstrap_sampling(returns, n_sims=2000, block_size=63, years=20):
-    # NOTE: '12' assumes your data is Monthly. If Daily, change 12 to 252.
+    """Robust Bootstrap for Stress Testing"""
+    # Assuming daily returns (~252 trading days)
     n_periods_target = 12 * years 
     n_blocks = int(n_periods_target / block_size)
     
@@ -70,31 +92,25 @@ def block_bootstrap_sampling(returns, n_sims=2000, block_size=63, years=20):
     ret_values = returns.values
     data_len = len(ret_values)
     
-    # Safety check
     if data_len < block_size: 
         return [-1.0] * n_sims, [0.0] * n_sims
 
     for _ in range(n_sims):
         sim_path = []
-        # Randomly select start points for blocks
         starts = np.random.randint(0, data_len - block_size, size=n_blocks)
         for start in starts:
             block = ret_values[start : start + block_size]
             sim_path.extend(block)
         
         sim_rets = np.array(sim_path)
-        
-        # Build equity curve for this simulation
-        # Starts at 1.0
         equity = np.cumprod(1 + sim_rets)
         
-        # --- 1. Calculate Max Drawdown ---
+        # Max Drawdown
         peak = np.maximum.accumulate(equity)
         dd = (equity - peak) / peak
         dd_results.append(dd.min())
         
-        # --- 2. Calculate CAGR ---
-        # Final Equity multiple after 'years'
+        # CAGR
         final_multiple = equity[-1]
         cagr = (final_multiple ** (1 / years)) - 1
         cagr_results.append(cagr)
@@ -135,105 +151,101 @@ def save_new_winner(study, best_trial):
 # 3. OPTIMIZATION LOOP
 # ============================
 def run_optimization(trials=1000):
-    print(f"\n🛡️ STARTING CONTINUOUS OPTIMIZATION ({trials} trials)...")
-    print("Objective: 70% Real Performance (Test) + 30% Historical (Train)")
+    print(f"\n🛡️ STARTING 'ANTIFRAGILE' OPTIMIZATION ({trials} trials)...")
+    print("Objective: Maximize Return/Ulcer Ratio while Minimizing Turnover")
     
+    # Initial run to get dates
     base_eq, _, _, _ = research.run_full_strategy_backtest()
-    split_idx = int(len(base_eq) * 0.70)
+    split_idx = int(len(base_eq) * 0.75) # 75% Train / 25% Test
     split_date = base_eq.index[split_idx]
     
     print(f"📅 Split Date: {split_date.date()}")
-    print("-" * 130)
-    print(f"{'ITER':<5} | {'W.SCORE':<8} | {'CAGR(Te)':<9} | {'MaxDD(Te)':<9} | {'Sort(Te)':<8} | {'Diff':<7} | {'Lev':<4} | {'TopN':<4} | {'Crash':<5}")
-    print("-" * 130)
+    print("-" * 140)
+    print(f"{'ITER':<5} | {'SCORE':<8} | {'CAGR':<8} | {'MaxDD':<8} | {'Sharpe':<6} | {'Lev':<4} | {'TopN':<4} | {'Crash':<5} | {'Status'}")
+    print("-" * 140)
 
-    # 1. Load Anchor (Previous Winner)
     anchor = load_previous_winner()
 
     def objective(trial):
-        # --- SMART NARROWING LOGIC ---
-        if anchor:
-            # Leverage: +/- 0.15
+        # --- PARAMETER MAPPING (Matches New Strategy Core) ---
+        if anchor and trial.number < (trials * 0.4): # Use anchor for first 40%
+            # Narrow Search around Winner
             lev_c = anchor.get('max_lev', 2.0)
-            strategy.MAX_PORTFOLIO_LEVERAGE = trial.suggest_float('max_lev', max(1.5, lev_c - 0.15), min(2.5, lev_c + 0.15))
+            strategy.MAX_PORTFOLIO_LEVERAGE = trial.suggest_float('max_lev', max(1.0, lev_c - 0.25), min(2.5, lev_c + 0.25))
             
-            # Top N: Strict +/- 1
-            top_c = anchor.get('top_n', 7)
-            strategy.TOP_N_ASSETS = trial.suggest_int('top_n', max(4, top_c - 1), min(8, top_c + 1))
+            top_c = anchor.get('top_n', 6)
+            strategy.TOP_N_ASSETS = trial.suggest_int('top_n', max(3, top_c - 1), min(8, top_c + 1))
             
-            # Crash: FIXED ORDER (Low, High)
-            crash_c = anchor.get('crash_thresh', -0.10)
-            strategy.CRASH_THRESHOLD = trial.suggest_float('crash_thresh', max(-0.15, crash_c - 0.02), min(-0.05, crash_c + 0.02))
+            crash_c = anchor.get('crash_thresh', -0.12)
+            strategy.CRASH_THRESHOLD = trial.suggest_float('crash_thresh', max(-0.20, crash_c - 0.05), min(-0.05, crash_c + 0.05))
             
-            # Volatility: +/- 0.02
-            vol_c = anchor.get('vol_bull', 0.20)
-            strategy.TARGET_VOL_BULL = trial.suggest_float('vol_bull', max(0.15, vol_c - 0.02), min(0.25, vol_c + 0.02))
-            
-            # Allocation: +/- 0.10
-            anc_c = anchor.get('anchor_crash', 0.60)
-            strategy.ANCHOR_WEIGHT_CRASH = trial.suggest_float('anchor_crash', max(0.4, anc_c - 0.10), min(0.9, anc_c + 0.10))
+            vol_bull = anchor.get('vol_bull', 0.18)
+            strategy.TARGET_VOL_BULL = trial.suggest_float('vol_bull', max(0.10, vol_bull - 0.05), min(0.30, vol_bull + 0.05))
 
-            # Lookbacks
-            strategy.LOOKBACK_SMA_TREND = trial.suggest_int('sma_trend', 180, 240, step=10)
-            strategy.LOOKBACK_SMA_FAST = trial.suggest_int('sma_fast', 30, 60, step=5)
-            strategy.CRASH_LOOKBACK = trial.suggest_int('crash_lb', 15, 45, step=5)
+            # New Adaptive Params
+            strategy.LOOKBACK_SMA_TREND = trial.suggest_int('sma_trend', 150, 250, step=10)
+            strategy.LOOKBACK_SMA_FAST = trial.suggest_int('sma_fast', 30, 80, step=10)
             
-            w1 = trial.suggest_int('mom_w1', 30, 80, step=10)
-            w2 = trial.suggest_int('mom_w2', 90, 150, step=10)
+            w1 = trial.suggest_int('mom_w1', 40, 80, step=5)
+            w2 = trial.suggest_int('mom_w2', 100, 160, step=10)
             w3 = trial.suggest_int('mom_w3', 180, 250, step=10)
             strategy.MOMENTUM_WINDOW_1 = w1
             strategy.MOMENTUM_WINDOW_2 = w2
             strategy.MOMENTUM_WINDOW_3 = w3
-            
-            strategy.VOL_LOOKBACK = trial.suggest_int('vol_lb', 50, 80, step=5)
-            strategy.SATELLITE_RSI_ENTRY = trial.suggest_int('sat_rsi', 15, 35, step=5)
-            strategy.SATELLITE_ALLOCATION = trial.suggest_float('sat_alloc', 0.10, 0.20)
-            strategy.MAX_SINGLE_ASSET_EXPOSURE = trial.suggest_float('max_single', 0.40, 0.65)
-            strategy.TARGET_VOL_BEAR = trial.suggest_float('vol_bear', 0.05, 0.10)
 
         else:
-            # --- FALLBACK: WIDE SEARCH (Only if no file exists) ---
-            strategy.MAX_PORTFOLIO_LEVERAGE = trial.suggest_float('max_lev', 1.6, 2.4)
-            strategy.TOP_N_ASSETS = trial.suggest_int('top_n', 4, 8)
-            strategy.CRASH_THRESHOLD = trial.suggest_float('crash_thresh', -0.12, -0.06)
-            strategy.TARGET_VOL_BULL = trial.suggest_float('vol_bull', 0.18, 0.25)
-            strategy.TARGET_VOL_BEAR = trial.suggest_float('vol_bear', 0.05, 0.10)
-            strategy.ANCHOR_WEIGHT_CRASH = trial.suggest_float('anchor_crash', 0.60, 0.85)
-            strategy.LOOKBACK_SMA_TREND = trial.suggest_int('sma_trend', 180, 240, step=10)
-            strategy.LOOKBACK_SMA_FAST = trial.suggest_int('sma_fast', 30, 80, step=5)
-            strategy.CRASH_LOOKBACK = trial.suggest_int('crash_lb', 15, 60, step=5)
-            w1 = trial.suggest_int('mom_w1', 30, 80, step=10)
-            w2 = trial.suggest_int('mom_w2', 90, 150, step=10)
-            w3 = trial.suggest_int('mom_w3', 180, 250, step=10)
+            # Wide Search (Exploration)
+            strategy.MAX_PORTFOLIO_LEVERAGE = trial.suggest_float('max_lev', 1.0, 2.2)
+            strategy.TOP_N_ASSETS = trial.suggest_int('top_n', 3, 10)
+            strategy.CRASH_THRESHOLD = trial.suggest_float('crash_thresh', -0.20, -0.05)
+            strategy.TARGET_VOL_BULL = trial.suggest_float('vol_bull', 0.12, 0.35)
+            strategy.LOOKBACK_SMA_TREND = trial.suggest_int('sma_trend', 120, 300, step=20)
+            strategy.LOOKBACK_SMA_FAST = trial.suggest_int('sma_fast', 20, 100, step=10)
+            
+            w1 = trial.suggest_int('mom_w1', 20, 90, step=10)
+            w2 = trial.suggest_int('mom_w2', 80, 180, step=20)
+            w3 = trial.suggest_int('mom_w3', 150, 300, step=30)
             strategy.MOMENTUM_WINDOW_1 = w1
             strategy.MOMENTUM_WINDOW_2 = w2
             strategy.MOMENTUM_WINDOW_3 = w3
-            strategy.VOL_LOOKBACK = trial.suggest_int('vol_lb', 40, 80, step=5)
-            strategy.SATELLITE_RSI_ENTRY = trial.suggest_int('sat_rsi', 10, 35, step=5)
-            strategy.SATELLITE_ALLOCATION = trial.suggest_float('sat_alloc', 0.10, 0.20)
-            strategy.MAX_SINGLE_ASSET_EXPOSURE = trial.suggest_float('max_single', 0.40, 0.65)
+            
+        # Satellite Params
+        strategy.SATELLITE_ALLOCATION = trial.suggest_float('sat_alloc', 0.0, 0.25)
+        strategy.SATELLITE_RSI_ENTRY = trial.suggest_int('sat_rsi', 15, 40, step=5)
 
         try:
-            equity, _, _, _ = research.run_full_strategy_backtest()
+            # RUN BACKTEST
+            equity, turnover, _, _ = research.run_full_strategy_backtest()
+            
+            # SPLIT DATA
             train_eq = equity.loc[:split_date]
             test_eq = equity.loc[split_date:]
+            train_to = turnover.loc[:split_date]
+            test_to = turnover.loc[split_date:]
             
-            score_train = calculate_smart_score(train_eq)
-            score_test = calculate_smart_score(test_eq)
+            # CALCULATE SCORES
+            score_train = calculate_smart_score(train_eq, train_to)
+            score_test = calculate_smart_score(test_eq, test_to)
             
-            # Weighted Score (80% Test / 20% Train)
-            final_score = (0.20 * score_train) + (0.80 * score_test)
+            # Weighted Score (Favor Test Consistency)
+            # If train is great but test fails, score is heavily penalized
+            if score_test < 0:
+                final_score = score_test # Fail
+            else:
+                final_score = (0.4 * score_train) + (0.6 * score_test)
             
+            # Reporting Metrics
             test_cagr = research.calculate_cagr(test_eq)
-            train_cagr = research.calculate_cagr(train_eq)
             test_dd = research.calculate_max_drawdown(test_eq)
-            test_sortino = research.calculate_sortino(test_eq.pct_change().dropna())
-            diff = test_cagr - train_cagr
+            test_sharpe = research.calculate_sharpe(test_eq.pct_change().dropna())
+            
+            status = "PASS" if test_cagr > 0.15 and test_dd > -0.30 else "WEAK"
 
-            print(f"{trial.number:<5} | {final_score:8.4f} | {test_cagr:8.2%}   | {test_dd:8.2%}   | {test_sortino:8.2f} | {diff:7.2%} | {strategy.MAX_PORTFOLIO_LEVERAGE:.2f} | {strategy.TOP_N_ASSETS:<4} | {strategy.CRASH_THRESHOLD:.2f}")
+            print(f"{trial.number:<5} | {final_score:8.4f} | {test_cagr:8.2%} | {test_dd:8.2%} | {test_sharpe:6.2f} | {strategy.MAX_PORTFOLIO_LEVERAGE:.2f} | {strategy.TOP_N_ASSETS:<4} | {strategy.CRASH_THRESHOLD:.2f} | {status}")
             
             trial.set_user_attr("test_cagr", test_cagr)
             trial.set_user_attr("test_dd", test_dd)
+            trial.set_user_attr("test_sharpe", test_sharpe)
             
             return final_score
             
@@ -242,7 +254,7 @@ def run_optimization(trials=1000):
 
     study = optuna.create_study(
         direction='maximize', 
-        study_name="fortress_study", 
+        study_name="fortress_study_v2", 
         storage=DB_FILE,
         load_if_exists=True
     )
@@ -254,187 +266,228 @@ def run_optimization(trials=1000):
     study.optimize(objective, n_trials=trials)
     save_new_winner(study, study.best_trial)
     
-    print("\n🏆 OPTIMIZATION CHAMPION 🏆")
+    print("\n🏆 OPTIMIZATION COMPLETE")
     bt = study.best_trial
-    print(f"Trial #{bt.number} won with Score: {bt.value:.4f}")
+    print(f"Best Score: {bt.value:.4f}")
     
-    # --- AUTO TRIGGER STRESS TEST ---
-    print("\n⚡ AUTO-TRIGGERING STRESS TEST FOR WINNER...")
-    run_stress_test(study.best_trial.params)
-    
-    # --- AUTO TRIGGER 3D VISUALIZATION ---
-    print("\n🎨 OPENING 3D RADAR SURFACE...")
+    # Auto-Run Analysis
     run_visualization()
+    run_stress_test(study.best_trial.params)
 
 # ============================
-# 4. TOOL: 3D RADAR VISUALIZATION
+# 4. TOOLS: VISUALIZATION
 # ============================
 def normalize(series):
     return (series - series.min()) / (series.max() - series.min())
 
 def run_visualization():
-    print("Loading optimization history from database...")
+    print("\n🎨 Generating Visualization Suite...")
     try:
-        study = optuna.load_study(study_name="fortress_study", storage=DB_FILE)
-    except Exception as e:
-        print("❌ Error: Could not load optimization.db. Run --mode optimize first!")
+        study = optuna.load_study(study_name="fortress_study_v2", storage=DB_FILE)
+    except:
+        print("❌ Could not load DB.")
         return
 
     df = study.trials_dataframe()
     df = df[df.state == "COMPLETE"]
     
-    # Parameters to plot on the radar
-    params = {
-        'params_max_lev': 'Leverage',
-        'params_top_n': 'Top N',
-        'params_crash_thresh': 'Crash Trigger',
-        'params_mom_w2': 'Mom Window',
-        'params_vol_bull': 'Bull Vol',
-        'params_anchor_crash': 'Crash Alloc',
-        'params_sma_trend': 'Trend SMA'
-    }
-    
-    subset = df[list(params.keys())].copy()
-    for col in subset.columns:
-        subset[col] = normalize(subset[col])
-    
-    subset['score'] = df['value']
-    subset = subset.sort_values('score')
-    
-    fig = plt.figure(figsize=(12, 10))
-    ax = fig.add_subplot(111, projection='3d')
-
-    N = len(params)
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    angles = np.concatenate((angles, [angles[0]])) 
-
-    top_trials = subset.tail(60) 
-    
-    polys = []
-    z_heights = []
-    colors = []
-
-    print(f"Rendering 3D Radar Surface for top {len(top_trials)} trials...")
-
-    for i, row in top_trials.iterrows():
-        values = row[list(params.keys())].values
-        values = np.concatenate((values, [values[0]]))
+    # --- 1. Pareto Frontier (Risk vs Return) ---
+    if 'user_attrs_test_cagr' in df.columns and 'user_attrs_test_dd' in df.columns:
+        plt.figure(figsize=(10, 8))
         
-        x = values * np.cos(angles)
-        y = values * np.sin(angles)
-        z = row['score']
+        # Invert DD for plotting (so top-right is best)
+        x = df['user_attrs_test_dd'] * 100
+        y = df['user_attrs_test_cagr'] * 100
+        c = df['value'] # Score
         
-        verts = list(zip(x, y))
-        polys.append(verts)
-        z_heights.append(z)
-        colors.append(plt.cm.plasma((z - subset['score'].min()) / (subset['score'].max() - subset['score'].min())))
+        sc = plt.scatter(x, y, c=c, cmap='viridis', alpha=0.7, s=50)
+        plt.colorbar(sc, label='Objective Score')
+        
+        plt.xlabel("Max Drawdown (%)")
+        plt.ylabel("CAGR (%)")
+        plt.title("Pareto Frontier: Risk vs Reward Exploration")
+        plt.grid(True, alpha=0.3)
+        plt.axhline(0, color='black', lw=1)
+        
+        # Highlight Best
+        best_idx = df['value'].idxmax()
+        plt.scatter(x[best_idx], y[best_idx], color='red', s=150, edgecolors='black', label='Champion')
+        plt.legend()
+        
+        plt.savefig(os.path.join(OUTPUT_DIR, "chart_9_pareto_frontier.png"), dpi=300)
+        plt.close()
+        print("   • Pareto Frontier saved.")
 
-    poly_collection = PolyCollection(polys, facecolors=colors, edgecolors='gray', alpha=0.5)
-    ax.add_collection3d(poly_collection, zs=z_heights, zdir='z')
-
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
-    ax.set_zlim(subset['score'].min(), subset['score'].max())
+    # --- 2. 3D Radar (Parameters) ---
+    # (Same as before but updated params)
+    params = ['params_max_lev', 'params_top_n', 'params_vol_bull', 'params_mom_w2', 'params_crash_thresh']
+    valid_params = [p for p in params if p in df.columns]
     
-    for angle, label in zip(angles[:-1], params.values()):
-        x = 1.2 * np.cos(angle)
-        y = 1.2 * np.sin(angle)
-        ax.text(x, y, subset['score'].min(), label, fontsize=9, fontweight='bold')
+    if len(valid_params) >= 3:
+        subset = df[valid_params].copy()
+        for col in subset.columns:
+            subset[col] = normalize(subset[col])
+        
+        subset['score'] = df['value']
+        subset = subset.sort_values('score').tail(50) # Top 50
+        
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
 
-    ax.set_zlabel('Objective Score')
-    ax.set_title('3D Strategy DNA: Convergence to the Peak')
-    ax.grid(False)
-    ax.axis('off')
+        N = len(valid_params)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+        angles = np.concatenate((angles, [angles[0]])) 
 
-    # SAVE TO FILE INSTEAD OF SHOW
-    save_path = os.path.join(OUTPUT_DIR, "chart_8_optimization_radar.png")
-    plt.savefig(save_path, dpi=300)
-    print(f"🎨 3D Radar Chart saved to: {save_path}")
-    plt.close()
+        polys = []
+        z_heights = []
+        colors = []
+
+        for i, row in subset.iterrows():
+            values = row[valid_params].values
+            values = np.concatenate((values, [values[0]]))
+            x = values * np.cos(angles)
+            y = values * np.sin(angles)
+            z = row['score']
+            polys.append(list(zip(x, y)))
+            z_heights.append(z)
+            colors.append(plt.cm.plasma((z - subset['score'].min()) / (subset['score'].max() - subset['score'].min())))
+
+        poly = PolyCollection(polys, facecolors=colors, edgecolors='grey', alpha=0.3)
+        ax.add_collection3d(poly, zs=z_heights, zdir='z')
+
+        ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+        ax.set_zlim(subset['score'].min(), subset['score'].max())
+        ax.set_title("3D Parameter Convergence")
+        ax.axis('off')
+        
+        plt.savefig(os.path.join(OUTPUT_DIR, "chart_8_optimization_radar.png"), dpi=300)
+        plt.close()
+        print("   • 3D Radar saved.")
 
 # ============================
-# 5. TOOL: STRESS TEST
+# 5. TOOL: WALK-FORWARD VALIDATION (NEW)
+# ============================
+def run_walk_forward_analysis():
+    """
+    Simulates rolling 3-year windows to test regime consistency.
+    """
+    print("\n🚶 RUNNING WALK-FORWARD ANALYSIS...")
+    
+    # Load DNA
+    params = load_previous_winner()
+    if not params:
+        print("❌ No winner_dna.json found. Optimize first.")
+        return
+
+    # Inject Params
+    mapping = {
+        'max_lev': 'MAX_PORTFOLIO_LEVERAGE',
+        'top_n': 'TOP_N_ASSETS',
+        'crash_thresh': 'CRASH_THRESHOLD',
+        'vol_bull': 'TARGET_VOL_BULL',
+        'sma_trend': 'LOOKBACK_SMA_TREND',
+        'sma_fast': 'LOOKBACK_SMA_FAST',
+        'mom_w1': 'MOMENTUM_WINDOW_1',
+        'mom_w2': 'MOMENTUM_WINDOW_2',
+        'mom_w3': 'MOMENTUM_WINDOW_3',
+        'sat_alloc': 'SATELLITE_ALLOCATION',
+        'sat_rsi': 'SATELLITE_RSI_ENTRY'
+    }
+    for k, v in params.items():
+        if k in mapping: setattr(strategy, mapping[k], v)
+
+    # Run Full Backtest
+    equity, _, _, _ = research.run_full_strategy_backtest()
+    
+    # Rolling 3-Year Windows (approx 756 trading days)
+    window_size = 756
+    step_size = 126 # Step 6 months
+    
+    results = []
+    
+    for start_idx in range(0, len(equity) - window_size, step_size):
+        end_idx = start_idx + window_size
+        subset = equity.iloc[start_idx : end_idx]
+        
+        start_date = subset.index[0]
+        end_date = subset.index[-1]
+        
+        cagr = research.calculate_cagr(subset)
+        dd = research.calculate_max_drawdown(subset)
+        
+        results.append({
+            'Start': start_date,
+            'End': end_date,
+            'CAGR': cagr,
+            'MaxDD': dd,
+            'Score': cagr / abs(dd) if dd != 0 else 0
+        })
+        
+    res_df = pd.DataFrame(results)
+    
+    print("\n--- WALK FORWARD RESULTS (Rolling 3-Year) ---")
+    print(res_df[['Start', 'End', 'CAGR', 'MaxDD']].tail(10))
+    
+    # Plotting
+    plt.figure(figsize=(12, 6))
+    plt.plot(res_df['Start'], res_df['CAGR'], label='Rolling CAGR', color='green')
+    plt.plot(res_df['Start'], res_df['MaxDD'], label='Rolling MaxDD', color='red')
+    plt.axhline(0, color='black', linestyle='--')
+    plt.title("Walk-Forward Stability Check (Rolling 3-Year)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.savefig(os.path.join(OUTPUT_DIR, "chart_10_walk_forward.png"), dpi=300)
+    plt.close()
+    print("   • Walk-Forward chart saved.")
+
+# ============================
+# 6. TOOL: STRESS TEST
 # ============================
 def run_stress_test(params=None):
-    print(f"\n🎲 Running BLOCK BOOTSTRAP Stress Test ({100000} simulations)...")
+    print(f"\n🎲 Running BLOCK BOOTSTRAP Stress Test...")
     
-    # --- 1. Inject Parameters (Same as before) ---
+    # Inject Params if provided
     if params:
         mapping = {
             'max_lev': 'MAX_PORTFOLIO_LEVERAGE',
-            'max_single': 'MAX_SINGLE_ASSET_EXPOSURE',
-            'anchor_crash': 'ANCHOR_WEIGHT_CRASH',
+            'top_n': 'TOP_N_ASSETS',
+            'crash_thresh': 'CRASH_THRESHOLD',
+            'vol_bull': 'TARGET_VOL_BULL',
             'sma_trend': 'LOOKBACK_SMA_TREND',
             'sma_fast': 'LOOKBACK_SMA_FAST',
-            'crash_lb': 'CRASH_LOOKBACK',
-            'crash_thresh': 'CRASH_THRESHOLD',
             'mom_w1': 'MOMENTUM_WINDOW_1',
             'mom_w2': 'MOMENTUM_WINDOW_2',
-            'mom_w3': 'MOMENTUM_WINDOW_3',
-            'top_n': 'TOP_N_ASSETS',
-            'vol_bull': 'TARGET_VOL_BULL',
-            'vol_bear': 'TARGET_VOL_BEAR',
-            'vol_lb': 'VOL_LOOKBACK',
-            'sat_rsi': 'SATELLITE_RSI_ENTRY',
-            'sat_alloc': 'SATELLITE_ALLOCATION'
+            'mom_w3': 'MOMENTUM_WINDOW_3'
         }
         for k, v in params.items():
             if k in mapping: setattr(strategy, mapping[k], v)
 
-    # --- 2. Get Strategy Returns ---
     equity, _, _, _ = research.run_full_strategy_backtest()
-    # Ensure we drop NaNs so the bootstrap doesn't break
     daily_rets = equity.pct_change().dropna()
     
-    # --- 3. Run Bootstrap (Now captures CAGR too) ---
-    dd_results, cagr_results = block_bootstrap_sampling(daily_rets, n_sims=2000, block_size=6, years=20)
+    dd_results, cagr_results = block_bootstrap_sampling(daily_rets, n_sims=2000, block_size=63, years=20)
     
-    # --- 4. Calculate Statistics ---
-    # Drawdown Stats
     median_dd = np.median(dd_results)
-    worst_1_percent = np.percentile(dd_results, 1) # 1st percentile (very negative)
-    ruin_prob = np.mean([1 if r < -0.70 else 0 for r in dd_results])
+    worst_1_percent = np.percentile(dd_results, 1)
     
-    # CAGR Stats
-    cagr_worst_1 = np.percentile(cagr_results, 1)
-    cagr_bad_10 = np.percentile(cagr_results, 10)
-    cagr_median = np.median(cagr_results)
-    cagr_best_90 = np.percentile(cagr_results, 90)
-
-    # --- 5. Print Report ---
     print("=" * 40)
-    print(" 🎲 MONTE CARLO STRESS TEST RESULTS")
+    print(" 🎲 STRESS TEST RESULTS")
     print("=" * 40)
-    
-    print("\n--- GROWTH (CAGR) ---")
-    print(f"Worst Case (1%):    {cagr_worst_1:.2%}")
-    print(f"Bad Case (10%):     {cagr_bad_10:.2%}")
-    print(f"Median Case (50%):  {cagr_median:.2%}")
-    print(f"Best Case (90%):    {cagr_best_90:.2%}")
-
-    print("\n--- RISK (Max Drawdown) ---")
+    print(f"Median CAGR:        {np.median(cagr_results):.2%}")
     print(f"Median Drawdown:    {median_dd:.2%}")
-    print(f"Worst 1% Case:      {worst_1_percent:.2%}")
-
-    print("\n--- SURVIVAL ---")
-    print(f"Risk of Ruin (>70% Loss): {ruin_prob:.2%}")
+    print(f"Worst 1% Drawdown:  {worst_1_percent:.2%}")
     print("-" * 40)
     
-    # --- 6. Plotting (Saved to 'reports/') ---
     plt.figure(figsize=(10, 6))
     sns.scatterplot(x=dd_results, y=cagr_results, alpha=0.3, color="blue", s=10)
     plt.xlabel("Max Drawdown")
     plt.ylabel("CAGR")
     plt.title("Stress Test: Risk vs Reward Cloud")
     plt.axvline(median_dd, color='red', linestyle='--', label='Median DD')
-    plt.axhline(cagr_median, color='green', linestyle='--', label='Median CAGR')
-    plt.legend()
     plt.grid(True, alpha=0.3)
     
-    # SAVE TO FILE INSTEAD OF SHOW
-    save_path = os.path.join(OUTPUT_DIR, "chart_7_stress_test.png")
-    plt.savefig(save_path, dpi=300)
-    print(f"📊 Stress Test Chart saved to: {save_path}")
+    plt.savefig(os.path.join(OUTPUT_DIR, "chart_7_stress_test.png"), dpi=300)
     plt.close()
 
 # ============================
@@ -442,9 +495,11 @@ def run_stress_test(params=None):
 # ============================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, required=True, choices=['optimize', 'visualize', 'stress'])
+    parser.add_argument('--mode', type=str, required=True, 
+                        choices=['optimize', 'visualize', 'stress', 'walkforward'])
     args = parser.parse_args()
     
     if args.mode == 'optimize': run_optimization()
     elif args.mode == 'visualize': run_visualization()
     elif args.mode == 'stress': run_stress_test()
+    elif args.mode == 'walkforward': run_walk_forward_analysis()
