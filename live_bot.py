@@ -175,8 +175,12 @@ def execute_rebalance(force_trade=False):
         send_telegram_message(f"❌ Critical Data Error: {e}")
         return
 
-    today = pd.Timestamp.today()
-    target_portfolio = strategy.get_signal(data, today)
+        # FIX: Use the last actual date in the downloaded data
+    # This handles timezones, weekends, and holidays automatically.
+    last_market_date = data.index[-1]
+    
+    print(f"📅 Analyzing data for: {last_market_date.date()}")
+    target_portfolio = strategy.get_signal(data, last_market_date)
     target_dict = {t: w for t, w in target_portfolio}
     
     print(f"🎯 Target Allocation: {target_dict}")
