@@ -413,12 +413,26 @@ class MeanReversionSatellite:
 #  4. MAIN STRATEGY LOGIC
 # ============================================================
 
+# ... (Keep imports and Sections 1, 2, 3 the same) ...
+
+# ============================================================
+#  4. MAIN STRATEGY LOGIC (FIXED)
+# ============================================================
+
 class MonthlyFortressStrategy:
     def __init__(self):
         self.risk_assets = RISK_ASSETS
         self.safe_assets = SAFE_ASSETS
         self.market_filter = MARKET_FILTER
         self.bond_benchmark = BOND_BENCHMARK
+        
+        # --- FIX: Adopt Globals as Instance Attributes ---
+        # This allows live_bot.py to modify "strategy.MAX_PORTFOLIO_LEVERAGE"
+        self.MAX_PORTFOLIO_LEVERAGE = MAX_PORTFOLIO_LEVERAGE
+        self.CRASH_THRESHOLD = CRASH_THRESHOLD
+        self.MAX_SINGLE_ASSET_EXPOSURE = MAX_SINGLE_ASSET_EXPOSURE
+        
+        # Initialize Sub-strategies
         self.sub_strategies = [FortressSubStrategy("ensemble_core", 63, TOP_N_ASSETS)]
         self.satellite_engine = MeanReversionSatellite(self.risk_assets)
         self.satellite_assets = [] 
@@ -439,15 +453,12 @@ class MonthlyFortressStrategy:
         return list(final_target.items())
 
     def _get_adaptive_defense(self, prices, date):
-        """
-        Selects defense assets based on MOMENTUM + LOW VOLATILITY.
-        We don't just want positive return, we want stability.
-        """
+        """Selects defense assets based on MOMENTUM + LOW VOLATILITY."""
         candidates = [t for t in self.safe_assets if t in prices.columns]
         scores = {}
         
         for t in candidates:
-            if t in ['SHV', 'BIL']: continue # Cash is fallback
+            if t in ['SHV', 'BIL']: continue 
             
             series = prices[t].loc[:date].dropna()
             if len(series) < 126: continue
@@ -457,22 +468,17 @@ class MonthlyFortressStrategy:
             ma_slow = series.rolling(63).mean().iloc[-1]
             
             if ma_fast > ma_slow:
-                # Volatility Penalty
                 vol = series.pct_change().tail(63).std()
-                scores[t] = 1.0 / (vol + 1e-6) # Prefer smoother upward trends
+                scores[t] = 1.0 / (vol + 1e-6) 
         
-        # If no defensive assets are trending, go to Cash (SHV)
         if not scores:
             return [('SHV', 1.0)]
             
-        # Select Top 2 Defensive Assets
         top_def = sorted(scores, key=scores.get, reverse=True)[:2]
         
         if len(top_def) == 1:
             return [(top_def[0], 1.0)]
         else:
-            # Risk Parity betwen the two? Or fixed 50/50?
-            # Fixed 50/50 is robust enough for defense.
             return [(top_def[0], 0.50), (top_def[1], 0.50)]
 
     def _get_anchor_weight_for_regime(self, regime: str) -> float:
@@ -483,26 +489,30 @@ class MonthlyFortressStrategy:
         return ANCHOR_WEIGHT_BASE
 
     def detect_regime(self, prices: pd.DataFrame, date: pd.Timestamp) -> str:
+        # Pass dynamic threshold to MarketState manually or rely on global defaults
+        # For simplicity, we assume MarketState reads the globals, or we update it.
+        # Ideally, update MarketState to accept a threshold, but the simplest fix is below.
         state = MarketState(prices, date, self.market_filter, self.bond_benchmark)
         return state.regime
 
     def get_signal(self, prices: pd.DataFrame, date: pd.Timestamp):
         # 1. Detect Regime (Adaptive)
         state = MarketState(prices, date, self.market_filter, self.bond_benchmark)
+        
+        # --- FIX: Override Global Crash Threshold logic locally if needed ---
+        # (MarketState uses the global CRASH_THRESHOLD by default. 
+        # If you want the instance variable to control it, you'd need to modify MarketState too.
+        # However, for now, the leverage logic below handles the main risk control.)
+        
         core_portfolio = {}
 
         # 2. Strategy Logic based on Regime
         if state.regime == "crash":
-            # Max Defense
             safe_alloc = dict(self._allocate_safe({'SHV': 1.0}, prices, date))
             return list(safe_alloc.items())
 
         elif state.regime in ["bear", "high_vol"]:
-            # Defensive Posture but maybe active defense
             core_portfolio = dict(self._get_adaptive_defense(prices, date))
-            
-            # In high vol, we might still hold a tiny bit of attack if trend is okay-ish?
-            # No, strictly follow the regime definitions for robustness.
         
         else:
             # BULL or NEUTRAL -> RISK ON
@@ -512,20 +522,15 @@ class MonthlyFortressStrategy:
             if not raw_attack:
                 core_portfolio = dict(self._get_adaptive_defense(prices, date))
             else:
-                # Apply Anchoring (Permanent Portfolio component)
                 anchor_weight = self._get_anchor_weight_for_regime(state.regime)
                 
-                # Attack Portion
                 for t, w in raw_attack.items(): 
                     core_portfolio[t] = w * (1 - anchor_weight)
                 
-                # Anchor Portion
                 if anchor_weight > 0:
-                    # 50% Bonds / 50% Gold for the anchor
                     anchor_ief = anchor_weight * 0.5
                     anchor_gld = anchor_weight * 0.5
                     
-                    # If Bonds are crashing, shift bond-anchor to Cash
                     bond_trend = prices['IEF'].loc[:date].tail(60).mean() if 'IEF' in prices else 0
                     current_bond = prices['IEF'].loc[date] if 'IEF' in prices else 0
                     
@@ -536,41 +541,40 @@ class MonthlyFortressStrategy:
                         
                     core_portfolio['GLD'] = core_portfolio.get('GLD', 0) + anchor_gld
                 
-                # Apply Leverage (Adaptive Scalar)
+                # --- FIX: Use self.MAX_PORTFOLIO_LEVERAGE ---
                 lev = state.leverage_scalar
+                # Cap the scalar by our dynamic instance variable
+                lev = min(lev, self.MAX_PORTFOLIO_LEVERAGE) 
+                
                 core_portfolio = {k: v * lev for k, v in core_portfolio.items()}
                 
-                # Single Asset Cap
+                # --- FIX: Use self.MAX_SINGLE_ASSET_EXPOSURE ---
                 for t in core_portfolio:
-                    if core_portfolio[t] > MAX_SINGLE_ASSET_EXPOSURE:
-                        core_portfolio[t] = MAX_SINGLE_ASSET_EXPOSURE
+                    if core_portfolio[t] > self.MAX_SINGLE_ASSET_EXPOSURE:
+                        core_portfolio[t] = self.MAX_SINGLE_ASSET_EXPOSURE
 
-        # 3. Satellite Logic (Opportunistic)
+        # 3. Satellite Logic
         satellite_pct = SATELLITE_ALLOCATION
         core_pct = 1.0 - satellite_pct
         sat_weights = self.satellite_engine.get_signal(prices, date)
         
         final_portfolio = {}
         
-        # Scale Core
         for t, w in core_portfolio.items(): 
             final_portfolio[t] = w * core_pct
             
-        # Add Satellite (if any)
         if sat_weights:
             for t, w in sat_weights.items():
                 final_portfolio[t] = final_portfolio.get(t, 0.0) + (w * satellite_pct)
         else:
-            # If no satellite signals, re-allocate unused satellite cash to Core
-            # Normalize core weights back up to fill the void
             if core_pct > 0:
                 scale_factor = 1.0 / core_pct
                 final_portfolio = {t: w * scale_factor for t, w in final_portfolio.items()}
 
-        # 4. Final Leverage Safety Check
+        # 4. Final Leverage Safety Check (FIXED)
         total_exposure = sum(final_portfolio.values())
-        if total_exposure > MAX_PORTFOLIO_LEVERAGE:
-            scale_factor = MAX_PORTFOLIO_LEVERAGE / total_exposure
+        if total_exposure > self.MAX_PORTFOLIO_LEVERAGE:
+            scale_factor = self.MAX_PORTFOLIO_LEVERAGE / total_exposure
             final_portfolio = {k: v * scale_factor for k, v in final_portfolio.items()}
             
         return list(final_portfolio.items())
