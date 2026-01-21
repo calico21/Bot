@@ -575,20 +575,55 @@ class MonthlyFortressStrategy:
             
         return list(final_portfolio.items())
 
+# strategy_core.py
+
 def is_rebalance_day(api_key, secret_key, paper=True):
-    trading_client = TradingClient(api_key, secret_key, paper=paper)
-    clock = trading_client.get_clock()
-    if not clock.is_open: return False
-    
-    today = date.today()
-    start_date = today.replace(day=1)
-    end_date = start_date + timedelta(days=40)
-    
-    req = GetCalendarRequest(start=start_date, end=end_date)
-    calendar = trading_client.get_calendar(filters=req)
-    
-    trading_days = [day.date for day in calendar]
-    if not trading_days: return False
-    
-    if today.weekday() == 4 and clock.is_open: return True
-    else: return False
+    """
+    Returns True if TODAY is the LAST trading day of the month.
+    """
+    try:
+        trading_client = TradingClient(api_key, secret_key, paper=paper)
+        
+        # 1. Check if Market is Open TODAY
+        clock = trading_client.get_clock()
+        if not clock.is_open:
+            return False
+            
+        today = date.today()
+        
+        # 2. Get Calendar for Today + Next 7 Days
+        # We need to peek into the future to see when the NEXT trading day is.
+        future_date = today + timedelta(days=7)
+        req = GetCalendarRequest(start=today, end=future_date)
+        calendar = trading_client.get_calendar(filters=req)
+        
+        trading_days = [day.date for day in calendar]
+        
+        if not trading_days:
+            return False
+            
+        # If today is not in the calendar, it's not a trading day (redundant check but safe)
+        if today not in trading_days:
+            return False
+            
+        # 3. Find the NEXT trading day
+        # trading_days[0] is Today (since we filtered start=today)
+        # trading_days[1] is the Next Trading Day
+        if len(trading_days) < 2:
+            # If we can't see a next trading day (end of year?), assume we rebalance to be safe.
+            return True
+            
+        next_trading_day = trading_days[1]
+        
+        # 4. The "Golden" Check:
+        # If Today is Month X, and Next Trading Day is Month Y -> It's End of Month!
+        if today.month != next_trading_day.month:
+            print(f"📅 Rebalance Signal: Today ({today}) is the last trading day of the month.")
+            return True
+            
+        print(f"💤 No Rebalance: Today is {today}, Next trading day is {next_trading_day} (Same Month).")
+        return False
+
+    except Exception as e:
+        print(f"⚠️ Calendar Error: {e}")
+        return False
