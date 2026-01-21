@@ -6,13 +6,14 @@ import requests
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Import Consolidated Logic
-from strategy_core import MonthlyFortressStrategy, is_rebalance_day
+# Import Consolidated Logic (Removed is_rebalance_day to avoid conflict)
+from strategy_core import MonthlyFortressStrategy
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -24,6 +25,7 @@ PAPER_MODE = True  # Set to False for real money
 LOG_FILE = "trade_history.csv"
 PERF_FILE = "live_performance.csv"
 DASHBOARD_IMG = "dashboard.png"
+DNA_FILE = "winner_dna.json"
 
 # Initialize Alpaca
 trade_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_MODE)
@@ -53,10 +55,58 @@ def send_telegram_photo(photo_path, caption=""):
     except Exception as e:
         print(f"❌ Telegram Photo Error: {e}")
 
-# --- 🛡️ CIRCUIT BREAKER (NEW) ---
-def run_circuit_breaker(max_loss_percent=-0.03):
+# --- 🧬 DNA LOADER (NEW) ---
+def load_fixed_dna(file_path=DNA_FILE):
+    """Loads your already-optimized parameters from the JSON file."""
+    if not os.path.exists(file_path):
+        print(f"⚠️ {file_path} not found. Using default strategy params.")
+        return None
+        
+    try:
+        with open(file_path, 'r') as f:
+            dna = json.load(f)
+            # Support both 'params' (standard) and 'best_params' (Optuna) keys
+            params = dna.get('params', dna.get('best_params', {}))
+            print(f"🧬 DNA Loaded: Using Optimized Settings (Lev: {params.get('max_lev', 'N/A')})")
+            return params
+    except Exception as e:
+        print(f"❌ Failed to load {file_path}: {e}")
+        return None
+
+# --- 📅 SCHEDULER LOGIC (NEW) ---
+def is_rebalance_day(client):
     """
-    Checks if today's P&L is worse than max_loss_percent (e.g., -3%).
+    Returns True ONLY on the Last Friday of the Month,
+    and ONLY if the market is actually open.
+    """
+    today = datetime.now()
+    
+    # 1. Check if it is Friday (Friday = 4)
+    if today.weekday() != 4:
+        return False
+
+    # 2. Check if it is the LAST Friday
+    # Logic: If next week is a new month, then today is the last specific weekday of this month.
+    next_week = today + timedelta(days=7)
+    if next_week.month == today.month:
+        return False  # There is another Friday left in this month
+
+    # 3. Check if Market is Open (Handles holidays)
+    try:
+        clock = client.get_clock()
+        if not clock.is_open:
+            print("⚠️ It is the Last Friday, but the Market is CLOSED.")
+            return False
+    except Exception as e:
+        print(f"⚠️ Clock Error: {e}")
+        return False
+
+    return True
+
+# --- 🛡️ CIRCUIT BREAKER ---
+def run_circuit_breaker(max_loss_percent=-0.045):
+    """
+    Checks if today's P&L is worse than max_loss_percent.
     If so, LIQUIDATES ALL POSITIONS to Cash.
     """
     try:
@@ -67,9 +117,6 @@ def run_circuit_breaker(max_loss_percent=-0.03):
         # Calculate daily return
         daily_return = (equity - last_equity) / last_equity
         
-        # Log status (optional, maybe too noisy for every 5 mins)
-        # print(f"🛡️ Safety Check: Portfolio is {daily_return:.2%}")
-
         if daily_return < max_loss_percent:
             msg = f"🚨 **CIRCUIT BREAKER TRIGGERED** 🚨\n\n📉 Daily Loss: {daily_return:.2%}\n🛑 Liquidating Portfolio to Cash!"
             print(msg)
@@ -151,35 +198,47 @@ def run_tracker():
 def execute_rebalance(force_trade=False):
     print("--- 🚀 STARTING REBALANCE CHECK ---")
     
-    if force_trade:
-        print("⚠️ FORCE MODE: Skipping Calendar Check.")
-        send_telegram_message("⚠️ **Force Trade Activated**")
-    else:
-        if not is_rebalance_day(API_KEY, SECRET_KEY, PAPER_MODE):
-            print("💤 Not a rebalance day. Sleeping.")
+    # CHECK 1: Is it the right day?
+    if not force_trade:
+        if not is_rebalance_day(trade_client):
+            print("💤 Not the Last Friday or Market is Closed. Sleeping.")
             return 
 
     send_telegram_message("🚀 **Fortress Bot Activated**\nAnalyzing Market...")
 
+    # Load DNA & Initialize Strategy
+    dna_params = load_fixed_dna()
     strategy = MonthlyFortressStrategy()
+    
+    # Inject Optimized Parameters if available
+    if dna_params:
+        strategy.MAX_PORTFOLIO_LEVERAGE = dna_params.get('max_lev', strategy.MAX_PORTFOLIO_LEVERAGE)
+        strategy.CRASH_THRESHOLD = dna_params.get('crash_thresh', strategy.CRASH_THRESHOLD)
+        # Add other parameter injections here if your strategy class supports them
+    
     tickers = list(set(strategy.risk_assets + strategy.safe_assets + ['SPY']))
     
-    print("📊 Downloading Live Data...")
+    print("📊 Downloading Live Data (5y History)...")
     try:
-        # Increased to 5y to ensure 300-day SMA has enough buffer
-        data = yf.download(tickers, period="5y", progress=False) 
+        # FIX: Increased to 5y to ensure 300-day SMA has enough data
+        data = yf.download(tickers, period="5y", progress=False)
+        
+        # Handle yfinance MultiIndex
         if isinstance(data.columns, pd.MultiIndex):
             data = data['Close']
+            
+        # FIX: Forward Fill to prevent NaNs from killing the signals
+        data = data.ffill()
+        
     except Exception as e:
         print(f"❌ Data Error: {e}")
         send_telegram_message(f"❌ Critical Data Error: {e}")
         return
 
-        # FIX: Use the last actual date in the downloaded data
-    # This handles timezones, weekends, and holidays automatically.
+    # FIX: Use the last available market date (avoids timestamp mismatch)
     last_market_date = data.index[-1]
+    print(f"📅 Analyzing data for date: {last_market_date.date()}")
     
-    print(f"📅 Analyzing data for: {last_market_date.date()}")
     target_portfolio = strategy.get_signal(data, last_market_date)
     target_dict = {t: w for t, w in target_portfolio}
     
@@ -192,7 +251,7 @@ def execute_rebalance(force_trade=False):
     
     trade_log = []
     
-    # SELL First
+    # SELL First (Clear space)
     for p in positions:
         if p.symbol not in target_dict:
             try:
@@ -201,26 +260,32 @@ def execute_rebalance(force_trade=False):
             except Exception as e:
                 print(f"❌ Error selling {p.symbol}: {e}")
 
-    # BUY/TRIM
-    target_equity = equity * 0.95
+    # BUY/TRIM (Delta Execution)
+    target_equity = equity * 0.95 # Leave 5% buffer for slippage
     live_prices = {}
+    
+    # Get prices for target assets
     for t in target_dict.keys():
         try:
             trade = trade_client.get_latest_trade(t)
             live_prices[t] = float(trade.price)
         except:
-            print(f"⚠️ No price for {t}")
+            print(f"⚠️ No live price found for {t}")
 
+    # Execute Orders
     for symbol, weight in target_dict.items():
         if symbol not in live_prices: continue
         price = live_prices[symbol]
         target_val = target_equity * weight
+        
+        # Skip tiny allocations
         if target_val < 50: continue 
         
-        target_qty = round(target_val / price, 9)
+        target_qty = round(target_val / price, 4) # Rounding to 4 decimal places
         current_qty = current_holdings.get(symbol, 0)
         delta_qty = target_qty - current_qty
 
+        # Skip insignificant moves (save fees/noise)
         if abs(delta_qty * price) < 10: continue 
 
         try:
@@ -228,6 +293,7 @@ def execute_rebalance(force_trade=False):
                 trade_client.submit_order(MarketOrderRequest(symbol=symbol, qty=delta_qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                 trade_log.append(f"🟢 Bought {delta_qty:.4f} {symbol}")
             elif delta_qty < 0:
+                # We use abs() because sell order quantity must be positive
                 trade_client.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(delta_qty), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
                 trade_log.append(f"📉 Trimmed {abs(delta_qty):.4f} {symbol}")
         except Exception as e:
@@ -252,10 +318,9 @@ if __name__ == "__main__":
     if args.track:
         run_tracker()
 
-    # MODE 2: Normal Trading Loop (Runs every 5 mins)
+    # MODE 2: Normal Trading Loop (Runs every 5 mins or daily via GitHub)
     else:
         # STEP 1: SAFETY CHECK (Circuit Breaker)
-        # If we are crashing, this function triggers, sells everything, and returns True.
         crash_triggered = run_circuit_breaker(max_loss_percent=-0.045)
 
         if crash_triggered:
@@ -263,5 +328,4 @@ if __name__ == "__main__":
             exit() # Stop script here. Do NOT rebalance.
 
         # STEP 2: STRATEGY CHECK
-        # If safe, check if we need to rebalance (1st of month)
         execute_rebalance(force_trade=args.force)
