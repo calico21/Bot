@@ -261,20 +261,49 @@ def execute_rebalance(force_trade=False):
                 print(f"❌ Error selling {p.symbol}: {e}")
 
     # BUY/TRIM (Delta Execution)
+    t# ... inside execute_rebalance ...
+
+    # BUY/TRIM (Delta Execution)
     target_equity = equity * 0.95 # Leave 5% buffer for slippage
     live_prices = {}
     
-    # Get prices for target assets
+    # --- FIX START: ROBUST PRICE FETCHER ---
+    print("💲 Fetching Execution Prices...")
     for t in target_dict.keys():
+        price_found = False
+        
+        # 1. Try Alpaca Real-Time Data first
         try:
             trade = trade_client.get_latest_trade(t)
             live_prices[t] = float(trade.price)
-        except:
-            print(f"⚠️ No live price found for {t}")
+            price_found = True
+        except Exception:
+            pass # Silently fail to fallback
+            
+        # 2. Fallback to Yahoo Finance (We already have this data!)
+        if not price_found:
+            try:
+                # Get the last close from the data we just downloaded
+                # Check if 'data' is a Series (single asset) or DataFrame (multiple)
+                if isinstance(data, pd.DataFrame) and t in data.columns:
+                    fallback_price = float(data[t].iloc[-1])
+                elif isinstance(data, pd.Series) and data.name == t:
+                    fallback_price = float(data.iloc[-1])
+                else:
+                    # Last ditch: download single ticker
+                    fallback_price = float(yf.download(t, period="1d", progress=False)['Close'].iloc[-1])
+                
+                live_prices[t] = fallback_price
+                print(f"⚠️ Using Yahoo fallback price for {t}: ${fallback_price:.2f}")
+                price_found = True
+            except Exception as e:
+                print(f"❌ COULD NOT FIND PRICE FOR {t}. Skipping. ({e})")
+    # --- FIX END ---
 
     # Execute Orders
     for symbol, weight in target_dict.items():
         if symbol not in live_prices: continue
+        # ... (rest of the function is the same)
         price = live_prices[symbol]
         target_val = target_equity * weight
         
