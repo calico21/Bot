@@ -164,7 +164,7 @@ def execute_rebalance(force_trade=False):
     strategy = MonthlyFortressStrategy()
     tickers = list(set(strategy.risk_assets + strategy.safe_assets + ['SPY']))
     
-    print    print("📊 Downloading Live Data...")
+    print("📊 Downloading Live Data...")
     try:
         # Increased to 5y to ensure 300-day SMA has enough buffer
         data = yf.download(tickers, period="5y", progress=False) 
