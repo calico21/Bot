@@ -164,9 +164,10 @@ def execute_rebalance(force_trade=False):
     strategy = MonthlyFortressStrategy()
     tickers = list(set(strategy.risk_assets + strategy.safe_assets + ['SPY']))
     
-    print("📊 Downloading Live Data...")
+    print    print("📊 Downloading Live Data...")
     try:
-        data = yf.download(tickers, period="2y", progress=False)
+        # Increased to 5y to ensure 300-day SMA has enough buffer
+        data = yf.download(tickers, period="5y", progress=False) 
         if isinstance(data.columns, pd.MultiIndex):
             data = data['Close']
     except Exception as e:
