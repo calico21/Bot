@@ -55,7 +55,7 @@ def send_telegram_photo(photo_path, caption=""):
     except Exception as e:
         print(f"❌ Telegram Photo Error: {e}")
 
-# --- 🧬 DNA LOADER (NEW) ---
+# --- 🧬 DNA LOADER ---
 def load_fixed_dna(file_path=DNA_FILE):
     """Loads your already-optimized parameters from the JSON file."""
     if not os.path.exists(file_path):
@@ -73,7 +73,7 @@ def load_fixed_dna(file_path=DNA_FILE):
         print(f"❌ Failed to load {file_path}: {e}")
         return None
 
-# --- 📅 SCHEDULER LOGIC (NEW) ---
+# --- 📅 SCHEDULER LOGIC ---
 def is_rebalance_day(client):
     """
     Returns True ONLY on the Last Friday of the Month,
@@ -86,7 +86,6 @@ def is_rebalance_day(client):
         return False
 
     # 2. Check if it is the LAST Friday
-    # Logic: If next week is a new month, then today is the last specific weekday of this month.
     next_week = today + timedelta(days=7)
     if next_week.month == today.month:
         return False  # There is another Friday left in this month
@@ -105,32 +104,26 @@ def is_rebalance_day(client):
 
 # --- 🛡️ CIRCUIT BREAKER ---
 def run_circuit_breaker(max_loss_percent=-0.045):
-    """
-    Checks if today's P&L is worse than max_loss_percent.
-    If so, LIQUIDATES ALL POSITIONS to Cash.
-    """
+    """Checks if today's P&L is worse than max_loss_percent. Liquidates if true."""
     try:
         acct = trade_client.get_account()
         equity = float(acct.equity)
         last_equity = float(acct.last_equity)
         
-        # Calculate daily return
         daily_return = (equity - last_equity) / last_equity
         
         if daily_return < max_loss_percent:
             msg = f"🚨 **CIRCUIT BREAKER TRIGGERED** 🚨\n\n📉 Daily Loss: {daily_return:.2%}\n🛑 Liquidating Portfolio to Cash!"
             print(msg)
             send_telegram_message(msg)
-            
-            # LIQUIDATE EVERYTHING
             trade_client.close_all_positions(cancel_orders=True)
             send_telegram_message("✅ **Emergency Liquidation Complete.** Sleeping until manual reset.")
-            return True # Triggered
+            return True 
             
     except Exception as e:
         print(f"⚠️ Circuit Breaker Error: {e}")
         
-    return False # Safe
+    return False 
 
 # --- TRACKER MODE (EVENING REPORT) ---
 def run_tracker():
@@ -210,32 +203,26 @@ def execute_rebalance(force_trade=False):
     dna_params = load_fixed_dna()
     strategy = MonthlyFortressStrategy()
     
-    # Inject Optimized Parameters if available
+    # Inject Optimized Parameters
     if dna_params:
         strategy.MAX_PORTFOLIO_LEVERAGE = dna_params.get('max_lev', strategy.MAX_PORTFOLIO_LEVERAGE)
         strategy.CRASH_THRESHOLD = dna_params.get('crash_thresh', strategy.CRASH_THRESHOLD)
-        # Add other parameter injections here if your strategy class supports them
     
     tickers = list(set(strategy.risk_assets + strategy.safe_assets + ['SPY']))
     
     print("📊 Downloading Live Data (5y History)...")
     try:
-        # FIX: Increased to 5y to ensure 300-day SMA has enough data
         data = yf.download(tickers, period="5y", progress=False)
-        
-        # Handle yfinance MultiIndex
         if isinstance(data.columns, pd.MultiIndex):
             data = data['Close']
-            
-        # FIX: Forward Fill to prevent NaNs from killing the signals
-        data = data.ffill()
+        data = data.ffill() # Forward fill missing data
         
     except Exception as e:
         print(f"❌ Data Error: {e}")
         send_telegram_message(f"❌ Critical Data Error: {e}")
         return
 
-    # FIX: Use the last available market date (avoids timestamp mismatch)
+    # Use last available date
     last_market_date = data.index[-1]
     print(f"📅 Analyzing data for date: {last_market_date.date()}")
     
@@ -251,7 +238,7 @@ def execute_rebalance(force_trade=False):
     
     trade_log = []
     
-    # SELL First (Clear space)
+    # SELL First
     for p in positions:
         if p.symbol not in target_dict:
             try:
@@ -260,37 +247,30 @@ def execute_rebalance(force_trade=False):
             except Exception as e:
                 print(f"❌ Error selling {p.symbol}: {e}")
 
-    # BUY/TRIM (Delta Execution)
-    t# ... inside execute_rebalance ...
-
-    # BUY/TRIM (Delta Execution)
-    target_equity = equity * 0.95 # Leave 5% buffer for slippage
+    # BUY/TRIM (Delta Execution with ROBUST PRICING)
+    target_equity = equity * 0.95 
     live_prices = {}
     
-    # --- FIX START: ROBUST PRICE FETCHER ---
     print("💲 Fetching Execution Prices...")
     for t in target_dict.keys():
         price_found = False
         
-        # 1. Try Alpaca Real-Time Data first
+        # 1. Try Alpaca
         try:
             trade = trade_client.get_latest_trade(t)
             live_prices[t] = float(trade.price)
             price_found = True
         except Exception:
-            pass # Silently fail to fallback
+            pass 
             
-        # 2. Fallback to Yahoo Finance (We already have this data!)
+        # 2. Fallback to Yahoo
         if not price_found:
             try:
-                # Get the last close from the data we just downloaded
-                # Check if 'data' is a Series (single asset) or DataFrame (multiple)
                 if isinstance(data, pd.DataFrame) and t in data.columns:
                     fallback_price = float(data[t].iloc[-1])
                 elif isinstance(data, pd.Series) and data.name == t:
                     fallback_price = float(data.iloc[-1])
                 else:
-                    # Last ditch: download single ticker
                     fallback_price = float(yf.download(t, period="1d", progress=False)['Close'].iloc[-1])
                 
                 live_prices[t] = fallback_price
@@ -298,23 +278,19 @@ def execute_rebalance(force_trade=False):
                 price_found = True
             except Exception as e:
                 print(f"❌ COULD NOT FIND PRICE FOR {t}. Skipping. ({e})")
-    # --- FIX END ---
 
     # Execute Orders
     for symbol, weight in target_dict.items():
         if symbol not in live_prices: continue
-        # ... (rest of the function is the same)
         price = live_prices[symbol]
         target_val = target_equity * weight
         
-        # Skip tiny allocations
         if target_val < 50: continue 
         
-        target_qty = round(target_val / price, 4) # Rounding to 4 decimal places
+        target_qty = round(target_val / price, 4)
         current_qty = current_holdings.get(symbol, 0)
         delta_qty = target_qty - current_qty
 
-        # Skip insignificant moves (save fees/noise)
         if abs(delta_qty * price) < 10: continue 
 
         try:
@@ -322,7 +298,6 @@ def execute_rebalance(force_trade=False):
                 trade_client.submit_order(MarketOrderRequest(symbol=symbol, qty=delta_qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
                 trade_log.append(f"🟢 Bought {delta_qty:.4f} {symbol}")
             elif delta_qty < 0:
-                # We use abs() because sell order quantity must be positive
                 trade_client.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(delta_qty), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
                 trade_log.append(f"📉 Trimmed {abs(delta_qty):.4f} {symbol}")
         except Exception as e:
@@ -343,18 +318,11 @@ if __name__ == "__main__":
     parser.add_argument('--track', action='store_true', help="Run Daily Tracker (No Trading)")
     args = parser.parse_args()
 
-    # MODE 1: Daily Tracker (Runs once in the evening)
     if args.track:
         run_tracker()
-
-    # MODE 2: Normal Trading Loop (Runs every 5 mins or daily via GitHub)
     else:
-        # STEP 1: SAFETY CHECK (Circuit Breaker)
         crash_triggered = run_circuit_breaker(max_loss_percent=-0.045)
-
         if crash_triggered:
             print("🛑 Execution Halted due to Circuit Breaker.")
-            exit() # Stop script here. Do NOT rebalance.
-
-        # STEP 2: STRATEGY CHECK
+            exit()
         execute_rebalance(force_trade=args.force)
