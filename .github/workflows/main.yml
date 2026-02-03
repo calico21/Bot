@@ -2,8 +2,8 @@ name: QuantBot Workflow
 
 on:
   schedule:
-    # 1. Rebalance Check: 19:40 UTC (Safe for US Winter & Summer)
-    - cron: '40 19 * * 1-5'
+    # 1. Rebalance Check: 17:00 UTC (Fixed for Early Close Days)
+    - cron: '00 17 * * 1-5'
     
     # 2. Daily Tracker: 21:30 UTC (After market close year-round)
     - cron: '30 21 * * 1-5'
@@ -57,7 +57,7 @@ jobs:
              echo "🌙 Evening Run. Sending Daily Report..."
              python live_bot.py --track
              
-          # --- REBALANCE CHECK (15:30 UTC) ---
+          # --- REBALANCE CHECK (17:00 UTC) ---
           else
              echo "☀️ Prime Time. Checking Rebalance Logic..."
              python live_bot.py
