@@ -12,8 +12,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Import Consolidated Logic (Removed is_rebalance_day to avoid conflict)
-from strategy_core import MonthlyFortressStrategy
+# --- FIXED: Import the SMART scheduler, not just the class ---
+from strategy_core import MonthlyFortressStrategy, is_rebalance_day
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("ALPACA_API_KEY")
@@ -65,44 +65,14 @@ def load_fixed_dna(file_path=DNA_FILE):
     try:
         with open(file_path, 'r') as f:
             dna = json.load(f)
-            # Support both 'params' (standard) and 'best_params' (Optuna) keys
-            params = dna.get('params', dna.get('best_params', {}))
+            params = data.get('params', {})
             print(f"🧬 DNA Loaded: Using Optimized Settings (Lev: {params.get('max_lev', 'N/A')})")
             return params
     except Exception as e:
         print(f"❌ Failed to load {file_path}: {e}")
         return None
 
-# --- 📅 SCHEDULER LOGIC ---
-def is_rebalance_day(client):
-    """
-    Returns True ONLY on the Last Friday of the Month,
-    and ONLY if the market is actually open.
-    """
-    today = datetime.now()
-    
-    # 1. Check if it is Friday (Friday = 4)
-    if today.weekday() != 4:
-        return False
-
-    # 2. Check if it is the LAST Friday
-    next_week = today + timedelta(days=7)
-    if next_week.month == today.month:
-        return False  # There is another Friday left in this month
-
-    # 3. Check if Market is Open (Handles holidays)
-    try:
-        clock = client.get_clock()
-        if not clock.is_open:
-            print("⚠️ It is the Last Friday, but the Market is CLOSED.")
-            return False
-    except Exception as e:
-        print(f"⚠️ Clock Error: {e}")
-        return False
-
-    return True
-
-# --- 🛡️ CIRCUIT BREAKER ---
+# --- 🛡️ CIRCUIT BREAKER (PORTFOLIO WIDE) ---
 def run_circuit_breaker(max_loss_percent=-0.045):
     """Checks if today's P&L is worse than max_loss_percent. Liquidates if true."""
     try:
@@ -124,6 +94,24 @@ def run_circuit_breaker(max_loss_percent=-0.045):
         print(f"⚠️ Circuit Breaker Error: {e}")
         
     return False 
+
+# --- 🛑 INDIVIDUAL ASSET STOP LOSS (FIXED) ---
+def check_asset_stops(max_drawdown=0.08):
+    """
+    Runs Daily: Sells any single position that is down > 8% from its entry.
+    Prevents holding a crashing asset (like SLV) for a whole month.
+    """
+    print("🛡️ Checking Asset Stop Losses...")
+    try:
+        positions = trade_client.get_all_positions()
+        for p in positions:
+            pl_pct = float(p.unrealized_plpc)
+            if pl_pct < -max_drawdown:
+                print(f"🛑 STOP LOSS TRIGGERED: Selling {p.symbol} (Down {pl_pct:.2%})")
+                send_telegram_message(f"🛑 **Stop Loss Executed**\nSelling {p.symbol} @ {pl_pct:.2%}")
+                trade_client.close_position(p.symbol)
+    except Exception as e:
+        print(f"⚠️ Stop Loss Check Error: {e}")
 
 # --- TRACKER MODE (EVENING REPORT) ---
 def run_tracker():
@@ -148,7 +136,6 @@ def run_tracker():
             
         df.to_csv(PERF_FILE, index=False)
         
-        # Charting
         plt.figure(figsize=(10, 5))
         plot_df = df.copy()
         plot_df['Date'] = pd.to_datetime(plot_df['Date'])
@@ -191,19 +178,18 @@ def run_tracker():
 def execute_rebalance(force_trade=False):
     print("--- 🚀 STARTING REBALANCE CHECK ---")
     
-    # CHECK 1: Is it the right day?
+    # --- FIXED: Use the SMART scheduler from strategy_core ---
     if not force_trade:
-        if not is_rebalance_day(trade_client):
-            print("💤 Not the Last Friday or Market is Closed. Sleeping.")
+        # Pass API keys so it can check the Calendar
+        if not is_rebalance_day(API_KEY, SECRET_KEY, paper=PAPER_MODE):
+            print("💤 Not the Rebalance Day. Sleeping.")
             return 
 
     send_telegram_message("🚀 **Fortress Bot Activated**\nAnalyzing Market...")
 
-    # Load DNA & Initialize Strategy
     dna_params = load_fixed_dna()
     strategy = MonthlyFortressStrategy()
     
-    # Inject Optimized Parameters
     if dna_params:
         strategy.MAX_PORTFOLIO_LEVERAGE = dna_params.get('max_lev', strategy.MAX_PORTFOLIO_LEVERAGE)
         strategy.CRASH_THRESHOLD = dna_params.get('crash_thresh', strategy.CRASH_THRESHOLD)
@@ -215,14 +201,13 @@ def execute_rebalance(force_trade=False):
         data = yf.download(tickers, period="5y", progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             data = data['Close']
-        data = data.ffill() # Forward fill missing data
+        data = data.ffill() 
         
     except Exception as e:
         print(f"❌ Data Error: {e}")
         send_telegram_message(f"❌ Critical Data Error: {e}")
         return
 
-    # Use last available date
     last_market_date = data.index[-1]
     print(f"📅 Analyzing data for date: {last_market_date.date()}")
     
@@ -238,7 +223,6 @@ def execute_rebalance(force_trade=False):
     
     trade_log = []
     
-    # SELL First
     for p in positions:
         if p.symbol not in target_dict:
             try:
@@ -247,23 +231,18 @@ def execute_rebalance(force_trade=False):
             except Exception as e:
                 print(f"❌ Error selling {p.symbol}: {e}")
 
-    # BUY/TRIM (Delta Execution with ROBUST PRICING)
     target_equity = equity * 0.95 
     live_prices = {}
     
     print("💲 Fetching Execution Prices...")
     for t in target_dict.keys():
         price_found = False
-        
-        # 1. Try Alpaca
         try:
             trade = trade_client.get_latest_trade(t)
             live_prices[t] = float(trade.price)
             price_found = True
-        except Exception:
-            pass 
+        except Exception: pass 
             
-        # 2. Fallback to Yahoo
         if not price_found:
             try:
                 if isinstance(data, pd.DataFrame) and t in data.columns:
@@ -272,14 +251,12 @@ def execute_rebalance(force_trade=False):
                     fallback_price = float(data.iloc[-1])
                 else:
                     fallback_price = float(yf.download(t, period="1d", progress=False)['Close'].iloc[-1])
-                
                 live_prices[t] = fallback_price
                 print(f"⚠️ Using Yahoo fallback price for {t}: ${fallback_price:.2f}")
                 price_found = True
             except Exception as e:
                 print(f"❌ COULD NOT FIND PRICE FOR {t}. Skipping. ({e})")
 
-    # Execute Orders
     for symbol, weight in target_dict.items():
         if symbol not in live_prices: continue
         price = live_prices[symbol]
@@ -321,8 +298,12 @@ if __name__ == "__main__":
     if args.track:
         run_tracker()
     else:
+        # --- FIXED: Run Safety Checks DAILY ---
         crash_triggered = run_circuit_breaker(max_loss_percent=-0.045)
+        check_asset_stops(max_drawdown=0.08) # Sell losing assets even if not rebalance day
+        
         if crash_triggered:
             print("🛑 Execution Halted due to Circuit Breaker.")
             exit()
+            
         execute_rebalance(force_trade=args.force)
